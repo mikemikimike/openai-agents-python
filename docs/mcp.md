@@ -388,6 +388,7 @@ async with MCPServerManager(servers) as manager:
 Key behaviors:
 
 - `active_servers` includes only successfully connected servers when `drop_failed_servers=True` (the default).
+- If the input iterable repeats the same server object, the manager owns that server once: `all_servers` and `active_servers` contain one entry, and connection and cleanup run once for that server.
 - Failures are tracked in `failed_servers` and `errors`.
 - Set `strict=True` to raise on the first connection failure.
 - Call `reconnect(failed_only=True)` to retry failed servers, or `reconnect(failed_only=False)` to restart all servers.
@@ -485,6 +486,8 @@ Resources remain explicitly paginated. Pass the `nextCursor` from `list_resource
 ## Caching
 
 Every agent run calls `list_tools()` on each MCP server. Remote servers can introduce noticeable latency, so all of the MCP server classes expose a `cache_tools_list` option. Set it to `True` only if you are confident that the tool definitions do not change frequently. To force a fresh list later, call `invalidate_tools_cache()` on the server instance.
+
+When caching is enabled, each `list_tools()` result contains detached copies of the cached tool definitions, including nested input schemas. Dynamic tool-filter callbacks also inspect detached copies. Mutating a returned tool or a tool received by a filter therefore does not change the server's cached schema or later `list_tools()` results.
 
 ## Tracing
 

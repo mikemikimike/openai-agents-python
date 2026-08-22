@@ -59,6 +59,8 @@ In practice:
 
 When SDK-default nested handoff history preserves a message item verbatim, Sessions, `RunState`, and `to_input_list()` track the exact owned occurrence rather than deduplicating by content. Identical messages that occurred separately remain separate; only the already-owned occurrence is kept from being appended a second time.
 
+When model output is converted into replayable input, `to_input_list()`, [`ModelResponse.to_input_items()`][agents.items.ModelResponse.to_input_items], and each [`RunItemBase.to_input_item()`][agents.items.RunItemBase.to_input_item] call remove provider output-only `created_by` metadata. This includes `created_by` on nested `shell_call_output` chunks. The conversion rebuilds the affected mappings and does not mutate the original raw item.
+
 Unlike the JavaScript SDK, Python does not expose a separate `output` property containing only the model-format items newly generated during the run. Use `new_items` when you need SDK metadata, or inspect `raw_responses` when you need the raw model payloads.
 
 Resubmitting computer-tool items as conversation input uses the raw Responses payload shape. Preview-model `computer_call` items preserve a single `action`, while `gpt-5.5` computer calls can preserve batched `actions[]`. [`to_input_list()`][agents.result.RunResultBase.to_input_list] and [`RunState`][agents.run_state.RunState] keep whichever shape the model produced, so manually resubmitting those items as conversation input, pause/resume flows, and stored transcripts continue to work across both preview and GA computer-tool calls. Local execution results still appear as `computer_call_output` items in `new_items`.
