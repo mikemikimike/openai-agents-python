@@ -105,6 +105,10 @@ class SandboxRuntime(Generic[TContext]):
     def current_session(self) -> BaseSandboxSession | None:
         return self._session_manager.current_session
 
+    @property
+    def resume_state_after_cleanup_error(self) -> dict[str, object] | None:
+        return self._session_manager.resume_state_after_cleanup_error
+
     def apply_result_metadata(self, result: RunResult | RunResultStreaming) -> None:
         session = self.current_session
         result._sandbox_session = session
@@ -123,8 +127,13 @@ class SandboxRuntime(Generic[TContext]):
                             "Failed to enqueue sandbox memory after streamed run",
                             error,
                         )
-                    payload = await self.cleanup()
-                    result._sandbox_resume_state = payload
+                    try:
+                        payload = await self.cleanup()
+                    except Exception:
+                        result._sandbox_resume_state = self.resume_state_after_cleanup_error
+                        raise
+                    else:
+                        result._sandbox_resume_state = payload
                 finally:
                     result._sandbox_session = None
 

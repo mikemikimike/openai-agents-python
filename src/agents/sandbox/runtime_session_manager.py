@@ -70,6 +70,17 @@ class _SandboxSessionResources:
     def state(self) -> SandboxSessionState:
         return self._session.state
 
+    @property
+    def deferred_cleanup_task(self) -> asyncio.Task[Any] | None:
+        return self._deferred_cleanup_task
+
+    @property
+    def backend_preserved_after_cleanup(self) -> bool:
+        return (
+            self._session._should_preserve_backend_on_cleanup()
+            or self._session._has_pending_pty_cleanup_tasks()
+        )
+
     async def ensure_started(self) -> None:
         if self._started and await self._session.running():
             return
@@ -238,6 +249,9 @@ class SandboxRuntimeSessionManager(Generic[TContext]):
         self._resume_source_key_by_agent_id: dict[int, str] = {}
         self._available_resumed_keys_by_name: dict[str, list[str]] | None = None
         self._claimed_resumed_keys: set[str] = set()
+        self._deferred_cleanup_tasks: set[asyncio.Task[Any]] = set()
+        self._cleanup_finished = False
+        self._resume_state_after_cleanup_error: dict[str, object] | None = None
 
     @staticmethod
     def _resume_agent_base_key(agent: Agent[Any]) -> str:
@@ -266,6 +280,10 @@ class SandboxRuntimeSessionManager(Generic[TContext]):
         if resources is None:
             return None
         return resources.session
+
+    @property
+    def resume_state_after_cleanup_error(self) -> dict[str, object] | None:
+        return self._resume_state_after_cleanup_error
 
     def acquire_agent(self, agent: SandboxAgent[TContext]) -> None:
         agent_id = id(agent)
@@ -351,6 +369,7 @@ class SandboxRuntimeSessionManager(Generic[TContext]):
         with span_cm:
             cleanup_error: BaseException | None = None
             resume_state: dict[str, object] | None = None
+            self._resume_state_after_cleanup_error = None
             try:
                 for resources in list(self._resources_by_agent.values()):
                     try:
@@ -358,15 +377,45 @@ class SandboxRuntimeSessionManager(Generic[TContext]):
                     except BaseException as exc:  # pragma: no cover
                         if cleanup_error is None:
                             cleanup_error = exc
+                    deferred_cleanup_task = resources.deferred_cleanup_task
+                    if deferred_cleanup_task is not None:
+                        self._track_deferred_cleanup_task(deferred_cleanup_task)
                 if cleanup_error is None:
                     resume_state = self.serialize_resume_state()
+                elif self._current_session_preserves_backend():
+                    try:
+                        self._resume_state_after_cleanup_error = self.serialize_resume_state()
+                    except BaseException:
+                        # Preserve the cleanup failure as the primary error when state
+                        # serialization cannot complete.
+                        self._resume_state_after_cleanup_error = None
             finally:
                 self._resources_by_agent.clear()
                 self._current_agent_id = None
-                self._release_agents()
+                self._cleanup_finished = True
+                if not self._deferred_cleanup_tasks:
+                    self._release_agents()
             if cleanup_error is not None:
                 raise cleanup_error
             return resume_state
+
+    def _current_session_preserves_backend(self) -> bool:
+        if self._current_agent_id is None:
+            return False
+        resources = self._resources_by_agent.get(self._current_agent_id)
+        return resources is not None and resources.backend_preserved_after_cleanup
+
+    def _track_deferred_cleanup_task(self, task: asyncio.Task[Any]) -> None:
+        if task.done():
+            return
+        self._deferred_cleanup_tasks.add(task)
+
+        def release_agents_after_cleanup(done: asyncio.Task[Any]) -> None:
+            self._deferred_cleanup_tasks.discard(done)
+            if self._cleanup_finished and not self._deferred_cleanup_tasks:
+                self._release_agents()
+
+        task.add_done_callback(release_agents_after_cleanup)
 
     async def _create_resources(
         self,

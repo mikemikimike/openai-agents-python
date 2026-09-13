@@ -2226,6 +2226,10 @@ class AgentRunner:
                     log_tool_action_warning(
                         logger, "Failed to clean up sandbox resources after run", error
                     )
+                    if completed_result is not None:
+                        completed_result._sandbox_resume_state = (
+                            sandbox_runtime.resume_state_after_cleanup_error
+                        )
                 else:
                     if completed_result is not None:
                         completed_result._sandbox_resume_state = sandbox_resume_state
