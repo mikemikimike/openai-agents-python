@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 import threading
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -36,6 +37,8 @@ from .session.sandbox_session_state import SandboxSessionState
 from .snapshot import NoopSnapshotSpec, SnapshotBase, SnapshotSpec
 from .snapshot_defaults import resolve_default_local_snapshot_spec
 from .types import User
+
+logger = logging.getLogger(__name__)
 
 
 def _supports_trace_spans() -> bool:
@@ -87,12 +90,20 @@ class _SandboxSessionResources:
         )
         self._deferred_cleanup_task = task
 
-        def consume_task_exception(done: asyncio.Task[Any]) -> None:
-            if not done.cancelled():
-                done.exception()
+        def observe_task_result(done: asyncio.Task[Any]) -> None:
+            if done.cancelled():
+                return
+            error = done.exception()
+            if error is not None:
+                logger.error(
+                    "Deferred sandbox cleanup failed: %s",
+                    error,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
 
-        task.add_done_callback(consume_task_exception)
+        task.add_done_callback(observe_task_result)
 
+    @redact_mount_error_data
     async def _finish_deferred_cleanup(self) -> None:
         try:
             while True:

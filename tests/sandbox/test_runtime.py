@@ -717,6 +717,94 @@ async def test_runner_owned_cleanup_waits_for_detached_snapshot_before_closing_d
 
 
 @pytest.mark.asyncio
+async def test_runner_owned_deferred_cleanup_reports_client_delete_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    upload_started = asyncio.Event()
+    release_upload = asyncio.Event()
+    source_error = RuntimeError("deferred delete failed")
+
+    class _RemoteSnapshotClient:
+        closed = False
+
+        async def upload(self, snapshot_id: str, data: io.IOBase) -> None:
+            _ = (snapshot_id, data)
+            upload_started.set()
+            await release_upload.wait()
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    class _DetachedSnapshotSession(_FakeSession):
+        def __init__(self, manifest: Manifest) -> None:
+            super().__init__(manifest)
+            self.state.snapshot = RemoteSnapshot(
+                id="detached",
+                client_dependency_key="remote_snapshot_client",
+            )
+
+        def _pty_cleanup_timeout_s(self) -> float:
+            return 0.01
+
+        async def _before_stop(self) -> None:
+            raise asyncio.CancelledError("pty cleanup failed")
+
+        async def stop(self) -> None:
+            self.stop_calls += 1
+            self._running = False
+            await BaseSandboxSession.stop(self)
+
+    class FailingDeleteClient(_FakeClient):
+        async def delete(self, session: SandboxSession) -> SandboxSession:
+            self.delete_calls += 1
+            raise source_error
+
+    snapshot_client = _RemoteSnapshotClient()
+    inner = _DetachedSnapshotSession(Manifest())
+    inner.set_dependencies(
+        Dependencies().bind_factory(
+            "remote_snapshot_client",
+            lambda _dependencies: snapshot_client,
+            owns_result=True,
+        )
+    )
+    client = FailingDeleteClient(inner)
+    resources = _SandboxSessionResources(
+        session=client.session,
+        client=client,
+        owns_session=True,
+    )
+    caplog.set_level(logging.ERROR, logger="agents.sandbox.runtime_session_manager")
+
+    cleanup = asyncio.create_task(resources.cleanup())
+    try:
+        await asyncio.wait_for(upload_started.wait(), timeout=0.5)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(cleanup, timeout=0.5)
+    finally:
+        release_upload.set()
+        if not cleanup.done():
+            with suppress(BaseException):
+                await asyncio.wait_for(cleanup, timeout=0.5)
+
+    async def wait_for_deferred_cleanup() -> None:
+        while not snapshot_client.closed:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_for_deferred_cleanup(), timeout=0.5)
+    deferred_task = resources._deferred_cleanup_task
+    assert deferred_task is not None
+    with pytest.raises(RuntimeError, match="deferred delete failed"):
+        await deferred_task
+
+    assert client.delete_calls == 1
+    assert any(
+        "Deferred sandbox cleanup failed: deferred delete failed" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("runner_owned", [False, True])
 async def test_pre_stop_cancellation_skips_persistence_and_completes_cleanup(
     runner_owned: bool,
