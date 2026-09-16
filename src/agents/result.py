@@ -357,12 +357,18 @@ class RunResultBase(abc.ABC):
     """Session item occurrences already represented verbatim in SDK-default nested history."""
     _sandbox_resume_state: dict[str, object] | None = field(default=None, init=False, repr=False)
     """Serialized sandbox session state captured during the run."""
+    _sandbox_resume_state_pending: bool = field(default=False, init=False, repr=False)
+    """Whether a late sandbox cleanup operation can still replace the resume state."""
     _sandbox_state_checkpoints: list[weakref.ReferenceType[RunState[Any]]] = field(
         default_factory=list, init=False, repr=False
     )
     """Live RunState checkpoints that receive late sandbox resume-state updates."""
     _sandbox_session: BaseSandboxSession | None = field(default=None, init=False, repr=False)
     """Live sandbox session attached to this run result when sandbox execution is enabled."""
+    _sandbox_cleanup: Callable[[], Awaitable[object]] | None = field(
+        default=None, init=False, repr=False
+    )
+    """Runner-owned sandbox cleanup that remains available after an incomplete cleanup."""
     _starting_agent_for_state: Agent[Any] | None = field(default=None, init=False, repr=False)
     """Root agent graph used when converting the result back into RunState."""
     _generated_prompt_cache_key: str | None = field(default=None, init=False, repr=False)
@@ -389,16 +395,38 @@ class RunResultBase(abc.ABC):
     def last_agent(self) -> Agent[Any]:
         """The last agent that was run."""
 
-    def _update_sandbox_resume_state(self, resume_state: dict[str, object] | None) -> None:
+    def _update_sandbox_resume_state(
+        self,
+        resume_state: dict[str, object] | None,
+        *,
+        pending: bool = False,
+    ) -> None:
         self._sandbox_resume_state = resume_state
+        self._sandbox_resume_state_pending = pending
         live_checkpoints: list[weakref.ReferenceType[RunState[Any]]] = []
         for checkpoint_ref in self._sandbox_state_checkpoints:
             checkpoint = checkpoint_ref()
             if checkpoint is None:
                 continue
             checkpoint._sandbox = copy.deepcopy(resume_state)
+            checkpoint._sandbox_resume_state_pending = pending
             live_checkpoints.append(checkpoint_ref)
         self._sandbox_state_checkpoints = live_checkpoints
+
+    def _set_sandbox_resume_state_pending(self, pending: bool) -> None:
+        self._sandbox_resume_state_pending = pending
+        for checkpoint_ref in self._sandbox_state_checkpoints:
+            checkpoint = checkpoint_ref()
+            if checkpoint is not None:
+                checkpoint._sandbox_resume_state_pending = pending
+
+    async def aclose(self) -> None:
+        """Retry runner-owned sandbox cleanup when the initial cleanup was incomplete."""
+
+        cleanup = self._sandbox_cleanup
+        if cleanup is None:
+            return
+        await cleanup()
 
     def release_agents(self, *, release_new_items: bool = True) -> None:
         """
@@ -581,6 +609,12 @@ class RunResult(RunResultBase):
                 result = await Runner.run(agent, state)
             ```
         """
+        if self._sandbox_resume_state_pending:
+            raise RuntimeError(
+                "Cannot serialize RunState while sandbox cleanup is still settling; retry after "
+                "the sandbox cleanup completes."
+            )
+
         # Create a RunState from the current result
         original_input_for_state = getattr(self, "_original_input", None)
         state = RunState(
@@ -604,6 +638,8 @@ class RunResult(RunResultBase):
             auto_previous_response_id=self._auto_previous_response_id,
         )
         _copy_pending_nested_agent_tool_states(state, self)
+        state._sandbox_resume_state_pending = self._sandbox_resume_state_pending
+        state._sandbox_resume_state_owner = weakref.ref(self)
         self._sandbox_state_checkpoints.append(weakref.ref(state))
         return state
 
@@ -705,13 +741,16 @@ class RunResultStreaming(RunResultBase):
     )
     """How reasoning IDs should be represented when converting to input history."""
     _run_impl_task: InitVar[asyncio.Task[Any] | None] = None
-    _sandbox_cleanup: Callable[[], Awaitable[None]] | None = field(
+    _sandbox_cleanup: Callable[[], Awaitable[object]] | None = field(
         default=None,
         init=False,
         repr=False,
     )
     _sandbox_cleanup_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
     _sandbox_cleanup_callback_registered: bool = field(default=False, init=False, repr=False)
+    _sandbox_cleanup_cancellation: asyncio.CancelledError | None = field(
+        default=None, init=False, repr=False
+    )
     _sandbox_wrapped_run_loop_task: asyncio.Task[Any] | None = field(
         default=None,
         init=False,
@@ -770,6 +809,9 @@ class RunResultStreaming(RunResultBase):
             async def _cleanup_once() -> None:
                 try:
                     await sandbox_cleanup()
+                except asyncio.CancelledError as error:
+                    self._sandbox_cleanup_cancellation = error
+                    raise
                 except Exception as error:
                     log_tool_action_warning(
                         logger,
@@ -1080,6 +1122,8 @@ class RunResultStreaming(RunResultBase):
                 if not cancelled:
                     await self._await_model_provider_cleanup()
                     await self._run_sandbox_cleanup()
+                    if self._sandbox_cleanup_cancellation is not None:
+                        raise self._sandbox_cleanup_cancellation
             finally:
                 # Allow any pending callbacks (e.g., cancellation handlers) to enqueue their
                 # completion sentinels before we clear the queues for observability.
@@ -1245,6 +1289,12 @@ class RunResultStreaming(RunResultBase):
                     pass
             ```
         """
+        if self._sandbox_resume_state_pending:
+            raise RuntimeError(
+                "Cannot serialize RunState while sandbox cleanup is still settling; retry after "
+                "the sandbox cleanup completes."
+            )
+
         # Create a RunState from the current result
         # Use _original_input (updated on handoffs/resume when input history changes).
         # This avoids serializing a mutated view of input history.
@@ -1267,5 +1317,7 @@ class RunResultStreaming(RunResultBase):
             auto_previous_response_id=self._auto_previous_response_id,
         )
         _copy_pending_nested_agent_tool_states(state, self)
+        state._sandbox_resume_state_pending = self._sandbox_resume_state_pending
+        state._sandbox_resume_state_owner = weakref.ref(self)
         self._sandbox_state_checkpoints.append(weakref.ref(state))
         return state

@@ -113,15 +113,39 @@ class SandboxRuntime(Generic[TContext]):
     def caller_cancelled_during_cleanup(self) -> bool:
         return self._session_manager.caller_cancelled_during_cleanup
 
+    @property
+    def cleanup_has_pending_work(self) -> bool:
+        return self._session_manager.cleanup_has_pending_work
+
+    @property
+    def runner_ownership_requires_transfer(self) -> bool:
+        return self._session_manager.runner_ownership_requires_transfer
+
     def register_resume_state_observer(self, observer: Callable[[dict[str, object]], None]) -> None:
         self._session_manager.register_resume_state_observer(observer)
+
+    def register_cleanup_finalization_observer(self, observer: Callable[[], None]) -> None:
+        self._session_manager.register_cleanup_finalization_observer(observer)
+
+    def finalize_result_ownership(self, result: RunResult | RunResultStreaming) -> None:
+        if self.runner_ownership_requires_transfer:
+            self._session_manager.detach_runner_agent_guards()
+            result._set_sandbox_resume_state_pending(self.cleanup_has_pending_work)
+            return
+        result._sandbox_cleanup = None
+        result._sandbox_session = None
+        result._set_sandbox_resume_state_pending(False)
 
     def apply_result_metadata(self, result: RunResult | RunResultStreaming) -> None:
         session = self.current_session
         result._sandbox_session = session
         self._session_manager.register_resume_state_observer(
-            lambda resume_state: result._update_sandbox_resume_state(resume_state)
+            lambda resume_state: result._update_sandbox_resume_state(
+                resume_state,
+                pending=self.cleanup_has_pending_work,
+            )
         )
+        self.register_cleanup_finalization_observer(lambda: self.finalize_result_ownership(result))
         if isinstance(result, RunResultStreaming):
 
             async def _cleanup_and_store() -> None:
@@ -142,14 +166,40 @@ class SandboxRuntime(Generic[TContext]):
                     except BaseException:
                         if self.resume_state_after_cleanup_error is not None:
                             result._update_sandbox_resume_state(
-                                self.resume_state_after_cleanup_error
+                                self.resume_state_after_cleanup_error,
+                                pending=self.cleanup_has_pending_work,
                             )
                         raise
                     else:
-                        if payload is not None:
-                            result._update_sandbox_resume_state(payload)
+                        result._update_sandbox_resume_state(
+                            payload,
+                            pending=self.cleanup_has_pending_work,
+                        )
                 finally:
-                    result._sandbox_session = None
+                    self.finalize_result_ownership(result)
+
+            result._sandbox_cleanup = _cleanup_and_store
+        else:
+
+            async def _cleanup_and_store() -> None:
+                try:
+                    payload = await self.cleanup()
+                except BaseException:
+                    if self.resume_state_after_cleanup_error is not None:
+                        result._update_sandbox_resume_state(
+                            self.resume_state_after_cleanup_error,
+                            pending=self.cleanup_has_pending_work,
+                        )
+                    raise
+                else:
+                    # Non-streaming runs publish a successful cleanup payload only when cleanup
+                    # remains incomplete; a fully deleted backend must not become a checkpoint.
+                    result._update_sandbox_resume_state(
+                        payload if self.runner_ownership_requires_transfer else None,
+                        pending=self.cleanup_has_pending_work,
+                    )
+                finally:
+                    self.finalize_result_ownership(result)
 
             result._sandbox_cleanup = _cleanup_and_store
 

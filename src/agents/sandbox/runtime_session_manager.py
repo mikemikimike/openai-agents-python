@@ -415,6 +415,8 @@ class SandboxRuntimeSessionManager(Generic[TContext]):
         self._resume_state_after_cleanup_error: dict[str, object] | None = None
         self._resume_state_serialization_failed = False
         self._resume_state_observers: list[Callable[[dict[str, object]], None]] = []
+        self._cleanup_finalization_observers: list[Callable[[], None]] = []
+        self._agent_guards_detached = False
 
     @staticmethod
     def _resume_agent_base_key(agent: Agent[Any]) -> str:
@@ -451,6 +453,44 @@ class SandboxRuntimeSessionManager(Generic[TContext]):
     @property
     def caller_cancelled_during_cleanup(self) -> bool:
         return self._caller_cancelled_during_cleanup
+
+    @property
+    def cleanup_has_pending_work(self) -> bool:
+        if not self._cleanup_finished:
+            return False
+        return bool(self._pending_resource_cleanup_tasks or self._deferred_cleanup_tasks) or any(
+            resources.session._has_pending_pty_cleanup_tasks()
+            for resources in self._resources_by_agent.values()
+        )
+
+    @property
+    def runner_ownership_requires_transfer(self) -> bool:
+        return bool(
+            self._resources_by_agent
+            or self._pending_resource_cleanup_tasks
+            or self._deferred_cleanup_tasks
+        )
+
+    def register_cleanup_finalization_observer(self, observer: Callable[[], None]) -> None:
+        """Notify a result when runner-owned cleanup has released all session resources."""
+
+        if self._cleanup_finished and not self.runner_ownership_requires_transfer:
+            observer()
+        else:
+            self._cleanup_finalization_observers.append(observer)
+
+    def detach_runner_agent_guards(self) -> None:
+        """Transfer resource ownership without blocking later runs of the same public agents."""
+
+        if self._agent_guards_detached:
+            return
+        self._agent_guards_detached = True
+        for agent in self._acquired_agents.values():
+            guard = getattr(agent, "_sandbox_concurrency_guard", None)
+            if guard is None:
+                continue
+            with guard.lock:
+                guard.active_runs = max(0, guard.active_runs - 1)
 
     def register_resume_state_observer(self, observer: Callable[[dict[str, object]], None]) -> None:
         """Publish a resume state produced after detached cleanup settles."""
@@ -781,6 +821,10 @@ class SandboxRuntimeSessionManager(Generic[TContext]):
         self._current_agent_id = None
         self._resume_state_observers.clear()
         self._release_agents()
+        finalization_observers = self._cleanup_finalization_observers
+        self._cleanup_finalization_observers = []
+        for observer in finalization_observers:
+            observer()
 
     def _track_deferred_cleanup_task(self, task: asyncio.Task[Any]) -> None:
         if task.done():
@@ -1525,6 +1569,8 @@ class SandboxRuntimeSessionManager(Generic[TContext]):
         for agent in released:
             guard = getattr(agent, "_sandbox_concurrency_guard", None)
             if guard is None:
+                continue
+            if self._agent_guards_detached:
                 continue
             with guard.lock:
                 guard.active_runs = max(0, guard.active_runs - 1)

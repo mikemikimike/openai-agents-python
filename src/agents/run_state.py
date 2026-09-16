@@ -7,6 +7,7 @@ import copy
 import dataclasses
 import json
 import math
+import weakref
 from collections import deque
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -869,6 +870,16 @@ class RunState(Generic[TContext, TAgent]):
     _sandbox: dict[str, Any] | None = field(default=None, repr=False)
     """Serialized sandbox resume payload for sandbox-aware runs."""
 
+    _sandbox_resume_state_pending: bool = field(default=False, repr=False)
+    """Whether sandbox cleanup may still replace the resume payload."""
+
+    _sandbox_resume_state_owner: weakref.ReferenceType[Any] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    """Live result that can invalidate or refresh this checkpoint's sandbox payload."""
+
     _schema_version: str = field(default=CURRENT_SCHEMA_VERSION, repr=False)
     """Schema version the snapshot was loaded from for schema-gated resume compatibility."""
 
@@ -924,6 +935,8 @@ class RunState(Generic[TContext, TAgent]):
         self._tool_use_tracker_snapshot = {}
         self._trace_state = None
         self._sandbox = None
+        self._sandbox_resume_state_pending = False
+        self._sandbox_resume_state_owner = None
         self._schema_version = CURRENT_SCHEMA_VERSION
         self._pending_session_write = None
         self._session_write_in_progress = False
@@ -1808,6 +1821,19 @@ class RunState(Generic[TContext, TAgent]):
             raise UserError("Cannot serialize RunState: No current agent")
         if self._context is None:
             raise UserError("Cannot serialize RunState: No context")
+        owner_ref = self._sandbox_resume_state_owner
+        owner = owner_ref() if owner_ref is not None else None
+        if owner is not None:
+            self._sandbox_resume_state_pending = bool(
+                getattr(owner, "_sandbox_resume_state_pending", False)
+            )
+            if not self._sandbox_resume_state_pending:
+                self._sandbox = copy.deepcopy(getattr(owner, "_sandbox_resume_state", None))
+        if self._sandbox_resume_state_pending:
+            raise UserError(
+                "Cannot serialize RunState while sandbox cleanup is still settling; retry after "
+                "the sandbox cleanup completes."
+            )
 
         approvals_dict = self._serialize_approvals()
         tool_invocations = self._serialize_tool_invocations()

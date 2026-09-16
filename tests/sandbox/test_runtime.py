@@ -261,6 +261,21 @@ class _PreservingFailingStopSession(_FakeSession):
         raise RuntimeError("stop failed while preserving backend")
 
 
+class _RetryablePreservingStopSession(_FakeSession):
+    def __init__(self, manifest: Manifest) -> None:
+        super().__init__(manifest)
+        self.stop_attempts = 0
+
+    async def stop(self) -> None:
+        self.stop_attempts += 1
+        self.stop_calls += 1
+        self._running = False
+        if self.stop_attempts == 1:
+            self._backend_preservation_required = True
+            raise RuntimeError("stop failed while preserving backend")
+        self._backend_preservation_required = False
+
+
 class _CancelledPreservingStopSession(_FakeSession):
     async def stop(self) -> None:
         self.stop_calls += 1
@@ -4596,6 +4611,205 @@ async def test_runner_keeps_sandbox_resume_state_when_cleanup_preserves_backend(
     assert client.delete_calls == 0
 
 
+@pytest.mark.asyncio
+async def test_runner_transfers_incomplete_cleanup_and_releases_agent_guard() -> None:
+    class CloseableDependency:
+        async def aclose(self) -> None:
+            return
+
+    session = _RetryablePreservingStopSession(Manifest())
+    session.set_dependencies(
+        Dependencies().bind_factory(
+            "snapshot_client",
+            lambda _dependencies: CloseableDependency(),
+            owns_result=True,
+        )
+    )
+    await session.dependencies.require("snapshot_client")
+    client = _FakeClient(session)
+    agent = SandboxAgent(
+        name="sandbox",
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
+        instructions="Base instructions.",
+    )
+
+    result = await Runner.run(agent, "hello", run_config=_sandbox_run_config(client))
+
+    assert result.final_output == "done"
+    assert result._sandbox_cleanup is not None
+    assert result._sandbox_session is not None
+    assert agent._sandbox_concurrency_guard is not None
+    assert agent._sandbox_concurrency_guard.active_runs == 0
+
+    state = result.to_state()
+    assert state._sandbox is not None
+
+    await result.aclose()
+
+    assert client.delete_calls == 1
+    assert session.stop_attempts == 2
+    assert result._sandbox_cleanup is None
+    assert result._sandbox_session is None
+    assert agent._sandbox_concurrency_guard.active_runs == 0
+    assert "sandbox" not in state.to_json()
+
+
+@pytest.mark.asyncio
+async def test_runner_keeps_retry_owner_after_a_failed_cleanup_retry() -> None:
+    class AlwaysFailingPreservingStopSession(_FakeSession):
+        async def stop(self) -> None:
+            self.stop_calls += 1
+            self._running = False
+            self._backend_preservation_required = True
+            raise RuntimeError("stop failed while preserving backend")
+
+    class CloseableDependency:
+        async def aclose(self) -> None:
+            return
+
+    session = AlwaysFailingPreservingStopSession(Manifest())
+    session.set_dependencies(
+        Dependencies().bind_factory(
+            "snapshot_client",
+            lambda _dependencies: CloseableDependency(),
+            owns_result=True,
+        )
+    )
+    await session.dependencies.require("snapshot_client")
+    client = _FakeClient(session)
+    agent = SandboxAgent(
+        name="sandbox",
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
+        instructions="Base instructions.",
+    )
+
+    result = await Runner.run(agent, "hello", run_config=_sandbox_run_config(client))
+
+    with pytest.raises(RuntimeError, match="stop failed"):
+        await result.aclose()
+
+    assert result._sandbox_cleanup is not None
+    assert result._sandbox_session is not None
+    assert agent._sandbox_concurrency_guard is not None
+    assert agent._sandbox_concurrency_guard.active_runs == 0
+    assert client.delete_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_runner_does_not_expose_checkpoint_before_detached_snapshot_finishes() -> None:
+    release_pty = asyncio.Event()
+
+    class DelayedPtySession(_FakeSession):
+        def _pty_cleanup_timeout_s(self) -> float:
+            return 0.01
+
+        async def stop(self) -> None:
+            self.stop_calls += 1
+            self._running = False
+            await BaseSandboxSession.stop(self)
+
+        async def _before_stop(self) -> None:
+            async def close_pty() -> None:
+                await release_pty.wait()
+
+            await self._settle_pty_cleanup(close_pty())
+
+    session = DelayedPtySession(Manifest())
+    client = _FakeClient(session)
+    agent = SandboxAgent(
+        name="sandbox",
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
+        instructions="Base instructions.",
+    )
+
+    result = await Runner.run(agent, "hello", run_config=_sandbox_run_config(client))
+
+    assert result._sandbox_resume_state_pending
+    with pytest.raises(RuntimeError, match="sandbox cleanup is still settling"):
+        result.to_state()
+    assert client.delete_calls == 0
+
+    release_pty.set()
+    await result.aclose()
+    await asyncio.sleep(0)
+    assert client.delete_calls == 1
+    state = result.to_state()
+    assert state._sandbox is None
+
+
+@pytest.mark.asyncio
+async def test_runner_updates_checkpoint_after_late_fallback_snapshot() -> None:
+    upload_started = asyncio.Event()
+    release_upload = asyncio.Event()
+
+    class RemoteSnapshotClient:
+        async def upload(self, snapshot_id: str, data: io.IOBase) -> None:
+            _ = (snapshot_id, data)
+            upload_started.set()
+            await release_upload.wait()
+
+        async def aclose(self) -> None:
+            return
+
+    class DetachedSnapshotSession(_FakeSession):
+        def __init__(self, manifest: Manifest) -> None:
+            super().__init__(manifest)
+            self.state.snapshot = RemoteSnapshot(
+                id="detached",
+                client_dependency_key="remote_snapshot_client",
+            )
+
+        def _pty_cleanup_timeout_s(self) -> float:
+            return 0.01
+
+        async def _before_stop(self) -> None:
+            raise asyncio.CancelledError("pty cleanup failed")
+
+        async def stop(self) -> None:
+            self.stop_calls += 1
+            self._running = False
+            await BaseSandboxSession.stop(self)
+
+    snapshot_client = RemoteSnapshotClient()
+    session = DetachedSnapshotSession(Manifest())
+    session.set_dependencies(
+        Dependencies().bind_factory(
+            "remote_snapshot_client",
+            lambda _dependencies: snapshot_client,
+            owns_result=True,
+        )
+    )
+    client = _FakeClient(session)
+    agent = SandboxAgent(
+        name="sandbox",
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
+        instructions="Base instructions.",
+    )
+
+    result = await Runner.run(agent, "hello", run_config=_sandbox_run_config(client))
+    await asyncio.wait_for(upload_started.wait(), timeout=0.5)
+
+    assert result._sandbox_resume_state_pending
+    with pytest.raises(RuntimeError, match="sandbox cleanup is still settling"):
+        result.to_state()
+
+    release_upload.set()
+
+    async def wait_for_delete() -> None:
+        while client.delete_calls == 0:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_for_delete(), timeout=0.5)
+
+    async def wait_for_cleanup_finalization() -> None:
+        while result._sandbox_resume_state_pending:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_for_cleanup_finalization(), timeout=0.5)
+    state = result.to_state()
+    assert state._sandbox is not None
+
+
 def test_late_sandbox_resume_state_updates_emitted_run_state_checkpoint() -> None:
     agent = Agent(name="sandbox")
     result = RunResult(
@@ -4613,6 +4827,10 @@ def test_late_sandbox_resume_state_updates_emitted_run_state_checkpoint() -> Non
     )
     result._update_sandbox_resume_state({"backend_id": "initial"})
     checkpoint = result.to_state()
+
+    result._set_sandbox_resume_state_pending(True)
+    with pytest.raises(UserError, match="sandbox cleanup is still settling"):
+        checkpoint.to_json()
 
     late_state = {"backend_id": "late"}
     result._update_sandbox_resume_state(late_state)

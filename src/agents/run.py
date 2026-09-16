@@ -962,7 +962,10 @@ class AgentRunner:
                     if caller_owned_run_state is not None:
                         caller_owned_run_state._sandbox = copy.deepcopy(resume_state)
                     if completed_result is not None:
-                        completed_result._update_sandbox_resume_state(resume_state)
+                        completed_result._update_sandbox_resume_state(
+                            resume_state,
+                            pending=sandbox_runtime.cleanup_has_pending_work,
+                        )
                         return
                     for error in (
                         run_cancellation,
@@ -2389,7 +2392,8 @@ class AgentRunner:
                     )
                     if completed_result is not None:
                         completed_result._update_sandbox_resume_state(
-                            sandbox_resume_state_after_cleanup
+                            sandbox_resume_state_after_cleanup,
+                            pending=sandbox_runtime.cleanup_has_pending_work,
                         )
                     if isinstance(error, asyncio.CancelledError) and (
                         completed_result is None or sandbox_runtime.caller_cancelled_during_cleanup
@@ -2398,11 +2402,14 @@ class AgentRunner:
                 else:
                     if completed_result is not None:
                         if sandbox_resume_state is not None:
-                            completed_result._update_sandbox_resume_state(sandbox_resume_state)
+                            completed_result._update_sandbox_resume_state(
+                                sandbox_resume_state,
+                                pending=sandbox_runtime.cleanup_has_pending_work,
+                            )
                     sandbox_resume_state_after_cleanup = sandbox_resume_state
                 finally:
                     if completed_result is not None:
-                        completed_result._sandbox_session = None
+                        sandbox_runtime.finalize_result_ownership(completed_result)
                     elif sandbox_resume_state_after_cleanup is not None:
                         # A non-streaming cancellation has no result object to carry state. Keep
                         # the recoverable backend state on the cancellation so callers can resume
