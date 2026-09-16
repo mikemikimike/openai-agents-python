@@ -274,8 +274,8 @@ class SandboxSession(BaseSandboxSession):
     def _require_backend_preservation(self) -> None:
         self._inner._require_backend_preservation()
 
-    def _has_pending_pty_cleanup_tasks(self) -> bool:
-        return self._inner._has_pending_pty_cleanup_tasks()
+    def _has_pending_pty_cleanup_tasks(self, *, exclude_snapshot: bool = False) -> bool:
+        return self._inner._has_pending_pty_cleanup_tasks(exclude_snapshot=exclude_snapshot)
 
     async def _wait_for_tracked_cleanup_tasks(
         self, *, timeout: float | None = None
@@ -289,6 +289,9 @@ class SandboxSession(BaseSandboxSession):
     def set_dependencies(self, dependencies: Dependencies | None) -> None:
         self._inner.set_dependencies(dependencies)
 
+    def _has_open_dependencies(self) -> bool:
+        return self._inner._has_open_dependencies()
+
     async def _aclose_dependencies(self) -> None:
         await self._inner._aclose_dependencies()
 
@@ -296,6 +299,14 @@ class SandboxSession(BaseSandboxSession):
         return self._inner._has_pending_dependency_close_task()
 
     async def _after_deferred_dependency_close(self) -> None:
+        try:
+            await self._inner._after_deferred_dependency_close()
+        except BaseException as inner_error:
+            try:
+                await self._instrumentation.flush()
+            except BaseException as flush_error:
+                raise inner_error from flush_error
+            raise
         await self._instrumentation.flush()
 
     def _set_concurrency_limits(self, limits: SandboxConcurrencyLimits) -> None:

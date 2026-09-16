@@ -3660,9 +3660,12 @@ async def test_docker_exec_timeout_uses_shared_executor(monkeypatch: pytest.Monk
     loop = asyncio.get_running_loop()
 
     def fake_run_in_executor(executor: object, func: object) -> asyncio.Future[object]:
-        _ = func
+        call_index = len(submitted_executors)
         submitted_executors.append(executor)
-        return asyncio.Future()
+        future: asyncio.Future[object] = asyncio.Future()
+        if call_index % 2 == 1:
+            future.set_result(cast(Callable[[], object], func)())
+        return future
 
     monkeypatch.setattr(loop, "run_in_executor", fake_run_in_executor)
 
@@ -3672,6 +3675,8 @@ async def test_docker_exec_timeout_uses_shared_executor(monkeypatch: pytest.Monk
         await session._exec_internal("sleep", "20", timeout=0.01)
 
     assert submitted_executors == [
+        docker_sandbox._DOCKER_EXECUTOR,
+        docker_sandbox._DOCKER_EXECUTOR,
         docker_sandbox._DOCKER_EXECUTOR,
         docker_sandbox._DOCKER_EXECUTOR,
     ]
@@ -3687,6 +3692,49 @@ async def test_docker_exec_timeout_uses_shared_executor(monkeypatch: pytest.Monk
             "workdir": None,
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_docker_exec_cancellation_tracks_blocked_executor_future(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container = _ExecRunContainer()
+    session = DockerSandboxSession(
+        docker_client=object(),
+        container=container,
+        state=DockerSandboxSessionState(
+            manifest=Manifest(root="/workspace"),
+            snapshot=NoopSnapshot(id="snapshot"),
+            image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+            container_id="container",
+        ),
+    )
+    session._workspace_root_ready = True
+    executor_future: asyncio.Future[object] = asyncio.Future()
+    loop = asyncio.get_running_loop()
+
+    def fake_run_in_executor(executor: object, func: object) -> asyncio.Future[object]:
+        _ = (executor, func)
+        return executor_future
+
+    monkeypatch.setattr(loop, "run_in_executor", fake_run_in_executor)
+
+    exec_task = asyncio.create_task(session._exec_internal("sleep", "10"))
+    await asyncio.sleep(0)
+    exec_task.cancel("caller cancellation")
+
+    with pytest.raises(asyncio.CancelledError, match="caller cancellation"):
+        await exec_task
+
+    assert session._pty_cleanup_tasks is not None
+    assert executor_future in session._pty_cleanup_tasks
+
+    executor_future.set_result(
+        type("_ExecResult", (), {"output": (b"", b""), "exit_code": 0})()
+    )
+    await session._wait_for_tracked_cleanup_tasks(timeout=0.5)
+    await asyncio.sleep(0)
+    assert not session._pty_cleanup_tasks
 
 
 @pytest.mark.asyncio
@@ -4954,9 +5002,14 @@ async def test_docker_pty_exec_start_times_out_blocking_docker_startup(
 
     original = getattr(api, operation)
 
+    startup_finished = threading.Event()
+
     def _delayed_operation(*args: object, **kwargs: object) -> object:
         time.sleep(0.2)
-        return original(*args, **kwargs)
+        try:
+            return original(*args, **kwargs)
+        finally:
+            startup_finished.set()
 
     monkeypatch.setattr(api, operation, _delayed_operation)
 
@@ -4969,8 +5022,171 @@ async def test_docker_pty_exec_start_times_out_blocking_docker_startup(
             yield_time_s=0.01,
         )
 
-    assert len(container.exec_calls) == 1
+    await asyncio.wait_for(asyncio.to_thread(startup_finished.wait), timeout=0.5)
+    assert len(container.exec_calls) >= 1
     _assert_pty_kill_call(container.exec_calls[0])
+    if operation == "exec_start":
+
+        async def wait_for_late_socket_close() -> None:
+            while not api.socket.closed:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_late_socket_close(), timeout=0.5)
+        assert api.socket.closed is True
+    else:
+
+        async def wait_for_late_kill() -> None:
+            while len(container.exec_calls) < 2:
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(wait_for_late_kill(), timeout=0.5)
+        assert len(container.exec_calls) >= 2
+
+
+@pytest.mark.asyncio
+async def test_docker_pty_exec_start_failure_after_timeout_still_kills_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = _FakePtyApi()
+    container = _FakePtyContainer(api)
+    session = DockerSandboxSession(
+        docker_client=object(),
+        container=container,
+        state=DockerSandboxSessionState(
+            manifest=Manifest(root="/workspace"),
+            snapshot=NoopSnapshot(id="snapshot"),
+            image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+            container_id="container",
+            workspace_root_ready=True,
+        ),
+    )
+    startup_finished = threading.Event()
+
+    def delayed_failed_exec_start(*args: object, **kwargs: object) -> object:
+        time.sleep(0.2)
+        startup_finished.set()
+        raise RuntimeError("late exec start failed")
+
+    monkeypatch.setattr(api, "exec_start", delayed_failed_exec_start)
+
+    with pytest.raises(ExecTimeoutError):
+        await session.pty_exec_start(
+            "python3",
+            shell=False,
+            tty=True,
+            timeout=0.01,
+            yield_time_s=0.01,
+        )
+
+    await asyncio.wait_for(asyncio.to_thread(startup_finished.wait), timeout=0.5)
+
+    async def wait_for_late_kill() -> None:
+        while len(container.exec_calls) < 2:
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(wait_for_late_kill(), timeout=0.5)
+    assert len(container.exec_calls) >= 2
+    _assert_pty_kill_call(container.exec_calls[0])
+    _assert_pty_kill_call(container.exec_calls[1])
+
+
+def test_docker_late_pty_start_cleanup_survives_event_loop_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = _FakePtyApi()
+    container = _FakePtyContainer(api)
+    session = DockerSandboxSession(
+        docker_client=object(),
+        container=container,
+        state=DockerSandboxSessionState(
+            manifest=Manifest(root="/workspace"),
+            snapshot=NoopSnapshot(id="snapshot"),
+            image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+            container_id="container",
+            workspace_root_ready=True,
+        ),
+    )
+    startup_started = threading.Event()
+    release_startup = threading.Event()
+
+    def delayed_exec_start(*args: object, **kwargs: object) -> object:
+        startup_started.set()
+        release_startup.wait()
+        return api.socket
+
+    monkeypatch.setattr(api, "exec_start", delayed_exec_start)
+
+    async def start_with_timeout() -> None:
+        with pytest.raises(ExecTimeoutError):
+            await session.pty_exec_start(
+                "python3",
+                shell=False,
+                tty=True,
+                timeout=0.01,
+                yield_time_s=0.01,
+            )
+
+    asyncio.run(start_with_timeout())
+    assert startup_started.is_set()
+    assert not api.socket.closed
+
+    release_startup.set()
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline and (not api.socket.closed or not container.exec_calls):
+        time.sleep(0.01)
+
+    assert api.socket.closed
+    assert container.exec_calls
+    _assert_pty_kill_call(container.exec_calls[-1])
+
+
+def test_docker_scheduled_pty_pid_cleanup_survives_event_loop_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = _FakePtyApi()
+    container = _FakePtyContainer(api)
+    session = DockerSandboxSession(
+        docker_client=object(),
+        container=container,
+        state=DockerSandboxSessionState(
+            manifest=Manifest(root="/workspace"),
+            snapshot=NoopSnapshot(id="snapshot"),
+            image=DEFAULT_PYTHON_SANDBOX_IMAGE,
+            container_id="container",
+            workspace_root_ready=True,
+        ),
+    )
+    executor = ThreadPoolExecutor(max_workers=1)
+    cleanup_started = threading.Event()
+    release_cleanup = threading.Event()
+
+    def delayed_cleanup(_pid_path: Path) -> None:
+        cleanup_started.set()
+        release_cleanup.wait()
+        container.exec_run(
+            cmd=["sh", "-lc", "cleanup"],
+            demux=True,
+            workdir=None,
+        )
+
+    monkeypatch.setattr(docker_sandbox, "_DOCKER_EXECUTOR", executor)
+    monkeypatch.setattr(session, "_kill_pty_pid_path_sync", delayed_cleanup)
+
+    async def schedule_cleanup() -> None:
+        session._schedule_pty_pid_cleanup(Path("/tmp/late.pid"))
+        await asyncio.wait_for(asyncio.to_thread(cleanup_started.wait), timeout=0.5)
+
+    try:
+        asyncio.run(schedule_cleanup())
+        assert cleanup_started.is_set()
+        release_cleanup.set()
+        executor.shutdown(wait=True)
+        assert container.exec_calls == [
+            {"cmd": ["sh", "-lc", "cleanup"], "demux": True, "workdir": None}
+        ]
+    finally:
+        release_cleanup.set()
+        executor.shutdown(wait=True, cancel_futures=True)
 
 
 @pytest.mark.asyncio

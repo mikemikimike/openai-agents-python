@@ -643,6 +643,60 @@ async def test_sandbox_session_aclose_runs_public_cleanup_lifecycle() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sandbox_session_keeps_dependencies_open_for_snapshot_retry() -> None:
+    class CloseableDependency:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    class RetryableSession(_FakeSession):
+        def __init__(self) -> None:
+            super().__init__(Manifest())
+            self.before_stop_attempts = 0
+            self.snapshot_attempts = 0
+
+        async def _before_stop(self) -> None:
+            self.before_stop_attempts += 1
+            if self.before_stop_attempts == 1:
+                raise RuntimeError("pty teardown failed")
+
+        async def _persist_snapshot(self) -> None:
+            self.snapshot_attempts += 1
+            if self.snapshot_attempts == 1:
+                raise RuntimeError("fallback snapshot failed")
+
+        async def stop(self) -> None:
+            await BaseSandboxSession.stop(self)
+
+    dependency = CloseableDependency()
+    inner = RetryableSession()
+    inner.set_dependencies(
+        Dependencies().bind_factory(
+            "snapshot_client",
+            lambda _dependencies: dependency,
+            owns_result=True,
+        )
+    )
+    await inner.dependencies.require("snapshot_client")
+    session = SandboxSession(inner)
+
+    with pytest.raises(RuntimeError, match="pty teardown failed"):
+        await session.aclose()
+
+    assert not dependency.closed
+    assert inner.shutdown_calls == 0
+    assert not inner._dependencies_closed
+
+    await session.aclose()
+
+    assert dependency.closed
+    assert inner.shutdown_calls == 1
+    assert inner._dependencies_closed
+
+
+@pytest.mark.asyncio
 async def test_sandbox_session_delegates_pending_dependency_close_state() -> None:
     inner = _FakeSession(Manifest())
     session = SandboxSession(inner)
@@ -651,6 +705,22 @@ async def test_sandbox_session_delegates_pending_dependency_close_state() -> Non
 
     assert session._has_pending_dependency_close_task()
     await close_task
+
+
+@pytest.mark.asyncio
+async def test_sandbox_session_delegates_deferred_dependency_close_hook() -> None:
+    inner = _FakeSession(Manifest())
+    session = SandboxSession(inner)
+    hook_called = asyncio.Event()
+
+    async def inner_hook() -> None:
+        hook_called.set()
+
+    inner._after_deferred_dependency_close = inner_hook  # type: ignore[method-assign]
+
+    await session._after_deferred_dependency_close()
+
+    assert hook_called.is_set()
 
 
 @pytest.mark.asyncio
@@ -871,7 +941,9 @@ def test_asyncio_run_waits_for_detached_pty_and_runner_finalization() -> None:
         assert registry == {}
         assert inner.shutdown_calls == 0
         assert client.delete_calls == 0
-        assert inner.close_dependency_calls >= 2
+        # The session has no bound dependencies; one final close is sufficient after the
+        # detached PTY owner settles.
+        assert inner.close_dependency_calls >= 1
         assert agent._sandbox_concurrency_guard is not None
         assert agent._sandbox_concurrency_guard.active_runs == 0
     finally:
@@ -967,6 +1039,7 @@ async def test_runner_owned_cleanup_waits_for_detached_snapshot_before_closing_d
         assert not snapshot_client.closed
         assert inner.shutdown_calls == 0
         assert client.delete_calls == 0
+        assert inner.close_dependency_calls == 0
     finally:
         release_upload.set()
         if not cleanup.done():
@@ -984,7 +1057,7 @@ async def test_runner_owned_cleanup_waits_for_detached_snapshot_before_closing_d
     assert not snapshot_client.closed_before_upload
     assert inner.shutdown_calls == 1
     assert client.delete_calls == 1
-    assert inner.close_dependency_calls == 2
+    assert inner.close_dependency_calls == 1
 
 
 @pytest.mark.asyncio
@@ -1374,7 +1447,9 @@ async def test_session_manager_logs_detached_follow_up_cleanup_failure(
 
     resource_cleanup = asyncio.create_task(fail_resource_cleanup())
     manager._track_resource_cleanup_task(resource_cleanup, resources)
-    follow_up = next(iter(manager._pending_resource_cleanup_tasks))
+    follow_up = next(
+        task for task in manager._pending_resource_cleanup_tasks if task is not resource_cleanup
+    )
 
     with caplog.at_level(logging.ERROR, logger="agents.sandbox.runtime_session_manager"):
         with pytest.raises(RuntimeError, match="detached follow-up failed"):
@@ -1406,7 +1481,9 @@ async def test_forced_follow_up_cancellation_skips_deferred_cleanup_wait() -> No
     deferred_cleanup = asyncio.create_task(asyncio.Event().wait())
     resources._deferred_cleanup_task = deferred_cleanup
     manager._track_resource_cleanup_task(resource_cleanup, resources)
-    follow_up = next(iter(manager._pending_resource_cleanup_tasks))
+    follow_up = next(
+        task for task in manager._pending_resource_cleanup_tasks if task is not resource_cleanup
+    )
 
     try:
         await asyncio.sleep(0)
@@ -1423,6 +1500,55 @@ async def test_forced_follow_up_cancellation_skips_deferred_cleanup_wait() -> No
 
 
 @pytest.mark.asyncio
+async def test_forced_detached_cleanup_keeps_resource_owner() -> None:
+    agent = SandboxAgent(name="worker", model=ScriptedModel(), instructions="Worker.")
+    session = _FakeSession(Manifest())
+    resources = _SandboxSessionResources(
+        session=session,
+        client=None,
+        owns_session=True,
+    )
+    manager = SandboxRuntimeSessionManager(
+        starting_agent=agent,
+        sandbox_config=SandboxRunConfig(session=session),
+        run_state=None,
+    )
+    manager.acquire_agent(agent)
+    manager._resources_by_agent[id(agent)] = resources
+    manager._current_agent_id = id(agent)
+    manager._cleanup_finished = True
+
+    resource_cleanup = create_cleanup_owner(
+        asyncio.Event().wait(),
+        name="tests.resource_cleanup",
+    )
+    manager._track_resource_cleanup_task(resource_cleanup, resources)
+    follow_up = next(
+        task for task in manager._pending_resource_cleanup_tasks if task is not resource_cleanup
+    )
+
+    try:
+        await asyncio.sleep(0)
+        assert force_cancel_cleanup_owner(resource_cleanup)
+        assert force_cancel_cleanup_owner(follow_up)
+        await asyncio.gather(resource_cleanup, follow_up, return_exceptions=True)
+
+        assert manager._resources_by_agent[id(agent)] is resources
+        assert resources._cleanup_abandoned
+        assert session._should_preserve_backend_on_cleanup()
+        assert agent._sandbox_concurrency_guard is not None
+        assert agent._sandbox_concurrency_guard.active_runs == 1
+    finally:
+        if not resource_cleanup.done():
+            resource_cleanup.cancel()
+        if not follow_up.done():
+            follow_up.cancel()
+        await asyncio.gather(resource_cleanup, follow_up, return_exceptions=True)
+        session._clear_backend_preservation_requirement()
+        await manager.cleanup()
+
+
+@pytest.mark.asyncio
 async def test_session_manager_serializes_preserved_backend_from_non_current_agent() -> None:
     client = _FakeClient(_FakeSession(Manifest()))
     preserved_agent = SandboxAgent(
@@ -1436,7 +1562,7 @@ async def test_session_manager_serializes_preserved_backend_from_non_current_age
         instructions="Current instructions.",
     )
     preserved_session = _PreservingFailingStopSession(Manifest())
-    current_session = _FakeSession(Manifest())
+    current_session = client.session
     manager = SandboxRuntimeSessionManager(
         starting_agent=preserved_agent,
         sandbox_config=SandboxRunConfig(client=client, options={"image": "sandbox"}),
@@ -1451,7 +1577,7 @@ async def test_session_manager_serializes_preserved_backend_from_non_current_age
     )
     manager._resources_by_agent[id(current_agent)] = _SandboxSessionResources(
         session=current_session,
-        client=None,
+        client=client,
         owns_session=True,
     )
     manager._current_agent_id = id(current_agent)
@@ -1463,7 +1589,217 @@ async def test_session_manager_serializes_preserved_backend_from_non_current_age
     assert resume_state is not None
     sessions_by_agent = cast(dict[str, dict[str, object]], resume_state["sessions_by_agent"])
     assert set(sessions_by_agent) == {preserved_agent.name, current_agent.name}
+    assert client.delete_calls == 1
     assert manager._acquired_agents == {}
+
+
+@pytest.mark.asyncio
+async def test_session_manager_allows_later_delete_while_prior_backend_is_preserved() -> None:
+    first_agent = SandboxAgent(name="first", model=ScriptedModel(), instructions="First.")
+    second_agent = SandboxAgent(name="second", model=ScriptedModel(), instructions="Second.")
+    first_inner = _FakeSession(Manifest())
+    second_inner = _FakeSession(Manifest())
+    first_client = _FakeClient(first_inner)
+    second_client = _FakeClient(second_inner)
+    first_resources = _SandboxSessionResources(
+        session=first_client.session,
+        client=first_client,
+        owns_session=True,
+    )
+    second_resources = _SandboxSessionResources(
+        session=second_client.session,
+        client=second_client,
+        owns_session=True,
+    )
+    second_deleted = asyncio.Event()
+
+    async def preserve_first_backend() -> None:
+        first_inner._backend_preservation_required = True
+        first_resources._mark_late_resume_state_pending()
+        raise RuntimeError("first cleanup failed")
+
+    async def delete_second_backend() -> None:
+        second_resources._mark_late_resume_state_pending()
+        await second_resources._wait_before_backend_delete()
+        await second_client.delete(second_resources.session)
+        second_deleted.set()
+
+    cast(Any, first_resources).cleanup = preserve_first_backend
+    cast(Any, second_resources).cleanup = delete_second_backend
+    manager = SandboxRuntimeSessionManager(
+        starting_agent=first_agent,
+        sandbox_config=SandboxRunConfig(
+            client=first_client,
+            options={"image": "sandbox"},
+        ),
+        run_state=None,
+    )
+    manager.acquire_agent(first_agent)
+    manager.acquire_agent(second_agent)
+    manager._resources_by_agent[id(first_agent)] = first_resources
+    manager._resources_by_agent[id(second_agent)] = second_resources
+    manager._current_agent_id = id(second_agent)
+
+    with pytest.raises(RuntimeError, match="first cleanup failed"):
+        await asyncio.wait_for(manager.cleanup(), timeout=0.5)
+
+    assert second_deleted.is_set()
+    assert second_client.delete_calls == 1
+    assert manager._cleanup_finished
+
+
+@pytest.mark.asyncio
+async def test_session_manager_keeps_dependencies_open_for_preserved_backend() -> None:
+    class CloseableDependency:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    class RetryablePreservingSession(_FakeSession):
+        def __init__(self) -> None:
+            super().__init__(Manifest())
+            self.stop_attempts = 0
+
+        async def stop(self) -> None:
+            self.stop_attempts += 1
+            if self.stop_attempts == 1:
+                self._backend_preservation_required = True
+                raise RuntimeError("snapshot failed")
+            self._backend_preservation_required = False
+
+    dependency = CloseableDependency()
+    session = RetryablePreservingSession()
+    session.set_dependencies(
+        Dependencies().bind_factory(
+            "snapshot_client",
+            lambda _dependencies: dependency,
+            owns_result=True,
+        )
+    )
+    await session.dependencies.require("snapshot_client")
+    agent = SandboxAgent(name="worker", model=ScriptedModel(), instructions="Worker.")
+    client = _FakeClient(session)
+    resources = _SandboxSessionResources(session=client.session, client=client, owns_session=True)
+    manager = SandboxRuntimeSessionManager(
+        starting_agent=agent,
+        sandbox_config=SandboxRunConfig(client=client, options={"image": "sandbox"}),
+        run_state=None,
+    )
+    manager.acquire_agent(agent)
+    manager._resources_by_agent[id(agent)] = resources
+    manager._current_agent_id = id(agent)
+
+    with pytest.raises(RuntimeError, match="snapshot failed"):
+        await manager.cleanup()
+
+    assert not dependency.closed
+    await manager.cleanup()
+    assert dependency.closed
+
+
+@pytest.mark.asyncio
+async def test_session_manager_retains_ownership_when_preserved_dependency_close_fails() -> None:
+    class CloseableDependency:
+        def __init__(self) -> None:
+            self.close_attempts = 0
+            self.closed = False
+
+        async def aclose(self) -> None:
+            self.close_attempts += 1
+            if self.close_attempts == 1:
+                raise RuntimeError("dependency close failed")
+            self.closed = True
+
+    dependency = CloseableDependency()
+    session = _FakeSession(Manifest())
+    session.set_dependencies(
+        Dependencies().bind_factory(
+            "snapshot_client",
+            lambda _dependencies: dependency,
+            owns_result=True,
+        )
+    )
+    await session.dependencies.require("snapshot_client")
+    agent = SandboxAgent(name="worker", model=ScriptedModel(), instructions="Worker.")
+    client = _FakeClient(session)
+    resources = _SandboxSessionResources(session=client.session, client=client, owns_session=True)
+    manager = SandboxRuntimeSessionManager(
+        starting_agent=agent,
+        sandbox_config=SandboxRunConfig(client=client, options={"image": "sandbox"}),
+        run_state=None,
+    )
+    manager.acquire_agent(agent)
+    manager._resources_by_agent[id(agent)] = resources
+    manager._current_agent_id = id(agent)
+    resources._dependencies_must_remain_open = True
+    session._backend_preservation_required = True
+    manager._cleanup_finished = True
+
+    close_attempts = 0
+
+    async def failing_dependency_close() -> None:
+        nonlocal close_attempts
+        close_attempts += 1
+        if close_attempts == 1:
+            raise RuntimeError("dependency close failed")
+        await BaseSandboxSession._aclose_dependencies(session)
+
+    session._aclose_dependencies = failing_dependency_close  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="dependency close failed"):
+        await resources._close_dependencies_after_preservation()
+
+    assert close_attempts == 1
+    assert session._has_open_dependencies()
+    assert session._should_preserve_backend_on_cleanup()
+    assert client.delete_calls == 0
+    assert manager._acquired_agents
+
+    manager._maybe_finalize_cleanup_state()
+    assert manager._acquired_agents
+
+    resources._dependency_close_failed = False
+    await resources._close_dependencies_after_preservation()
+
+    assert close_attempts == 2
+    assert not session._has_open_dependencies()
+    manager._maybe_finalize_cleanup_state()
+    assert manager._acquired_agents == {}
+
+
+@pytest.mark.asyncio
+async def test_session_manager_blocks_delete_when_late_resume_observer_fails() -> None:
+    agent = SandboxAgent(name="worker", model=ScriptedModel(), instructions="Worker.")
+    session = _FakeSession(Manifest())
+    session._backend_preservation_required = True
+    client = _FakeClient(session)
+    resources = _SandboxSessionResources(session=client.session, client=client, owns_session=True)
+    manager = SandboxRuntimeSessionManager(
+        starting_agent=agent,
+        sandbox_config=SandboxRunConfig(client=client, options={"image": "sandbox"}),
+        run_state=None,
+    )
+    manager.acquire_agent(agent)
+    manager._resources_by_agent[id(agent)] = resources
+    manager._current_agent_id = id(agent)
+    manager._cleanup_finished = True
+    manager._resume_state_after_cleanup_error = {"backend_id": "old"}
+    resources._set_before_backend_delete(manager._late_resume_state_callback_for(resources))
+
+    def failing_observer(_resume_state: dict[str, object]) -> None:
+        raise RuntimeError("resume observer failed")
+
+    manager._resume_state_observers.append(failing_observer)
+    resources._mark_late_resume_state_pending()
+
+    with pytest.raises(RuntimeError, match="resume observer failed"):
+        await resources._wait_before_backend_delete()
+
+    assert resources._late_resume_state_pending
+    assert session._should_preserve_backend_on_cleanup()
+    assert client.delete_calls == 0
 
 
 @pytest.mark.asyncio
@@ -1498,6 +1834,65 @@ async def test_session_manager_preserves_late_caller_cancellation_reason() -> No
 
     assert exc_info.value.args == ("late cancellation",)
     assert manager._cleanup_finished
+
+
+@pytest.mark.asyncio
+async def test_session_manager_detaches_later_resources_after_caller_cancellation() -> None:
+    first_agent = SandboxAgent(name="first", model=ScriptedModel(), instructions="First.")
+    second_agent = SandboxAgent(name="second", model=ScriptedModel(), instructions="Second.")
+    first_session = _FakeSession(Manifest())
+    second_session = _FakeSession(Manifest())
+    first_resources = _SandboxSessionResources(
+        session=first_session,
+        client=None,
+        owns_session=True,
+    )
+    second_resources = _SandboxSessionResources(
+        session=second_session,
+        client=None,
+        owns_session=True,
+    )
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+
+    async def wait_for_first_cleanup() -> None:
+        first_started.set()
+        await release_cleanup.wait()
+
+    async def wait_for_second_cleanup() -> None:
+        second_started.set()
+        await release_cleanup.wait()
+
+    cast(Any, first_resources).cleanup = wait_for_first_cleanup
+    cast(Any, second_resources).cleanup = wait_for_second_cleanup
+    manager = SandboxRuntimeSessionManager(
+        starting_agent=first_agent,
+        sandbox_config=SandboxRunConfig(session=first_session),
+        run_state=None,
+    )
+    manager.acquire_agent(first_agent)
+    manager.acquire_agent(second_agent)
+    manager._resources_by_agent[id(first_agent)] = first_resources
+    manager._resources_by_agent[id(second_agent)] = second_resources
+    manager._current_agent_id = id(second_agent)
+
+    cleanup = asyncio.create_task(manager.cleanup())
+    try:
+        await first_started.wait()
+        cleanup.cancel("caller cancellation")
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await asyncio.wait_for(cleanup, timeout=0.5)
+
+        assert exc_info.value.args == ("caller cancellation",)
+        await asyncio.wait_for(second_started.wait(), timeout=0.5)
+        assert manager._pending_resource_cleanup_tasks
+        assert not release_cleanup.is_set()
+    finally:
+        release_cleanup.set()
+        follow_ups = tuple(manager._pending_resource_cleanup_tasks)
+        if follow_ups:
+            await asyncio.gather(*follow_ups, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -1605,15 +2000,16 @@ async def test_session_manager_prioritizes_caller_cancellation_over_resume_state
     assert client.serialize_calls == 1
     assert manager.resume_state_after_cleanup_error is None
     assert manager._cleanup_finished
-    assert client.delete_calls == 1
-    assert not session._should_preserve_backend_on_cleanup()
+    assert client.delete_calls == 0
+    assert session._should_preserve_backend_on_cleanup()
 
     async def wait_for_agent_release() -> None:
         while manager._acquired_agents:
             await asyncio.sleep(0)
 
-    await asyncio.wait_for(wait_for_agent_release(), timeout=0.5)
-    assert manager._acquired_agents == {}
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(wait_for_agent_release(), timeout=0.05)
+    assert manager._acquired_agents
 
 
 @pytest.mark.asyncio
@@ -4200,6 +4596,32 @@ async def test_runner_keeps_sandbox_resume_state_when_cleanup_preserves_backend(
     assert client.delete_calls == 0
 
 
+def test_late_sandbox_resume_state_updates_emitted_run_state_checkpoint() -> None:
+    agent = Agent(name="sandbox")
+    result = RunResult(
+        input="hello",
+        new_items=[],
+        raw_responses=[],
+        final_output="done",
+        input_guardrail_results=[],
+        output_guardrail_results=[],
+        tool_input_guardrail_results=[],
+        tool_output_guardrail_results=[],
+        _last_agent=agent,
+        context_wrapper=RunContextWrapper(context=None),
+        interruptions=[],
+    )
+    result._update_sandbox_resume_state({"backend_id": "initial"})
+    checkpoint = result.to_state()
+
+    late_state = {"backend_id": "late"}
+    result._update_sandbox_resume_state(late_state)
+
+    assert result._sandbox_resume_state is late_state
+    assert checkpoint._sandbox == late_state
+    assert checkpoint._sandbox is not late_state
+
+
 @pytest.mark.asyncio
 async def test_runner_exposes_sandbox_resume_state_when_cancelled_before_result() -> None:
     session = _CancelledPreservingStopSession(Manifest())
@@ -4228,6 +4650,33 @@ async def test_runner_exposes_sandbox_resume_state_when_cleanup_cancels_without_
         model=_FailingRunModel(),
         instructions="Base instructions.",
     )
+
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        await Runner.run(agent, "hello", run_config=_sandbox_run_config(client))
+
+    resume_state = getattr(exc_info.value, "_sandbox_resume_state", None)
+    assert resume_state is not None
+    assert resume_state["backend_id"] == "fake"
+    assert client.delete_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_runner_exposes_sandbox_resume_state_when_memory_enqueue_cancels_without_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _PreservingFailingStopSession(Manifest())
+    client = _FakeClient(session)
+    agent = SandboxAgent(
+        name="sandbox",
+        model=_FailingRunModel(),
+        instructions="Base instructions.",
+    )
+
+    async def cancel_memory_enqueue(*args: Any, **kwargs: Any) -> None:
+        _ = (args, kwargs)
+        raise asyncio.CancelledError("memory enqueue cancelled")
+
+    monkeypatch.setattr(SandboxRuntime, "enqueue_memory_payload", cancel_memory_enqueue)
 
     with pytest.raises(asyncio.CancelledError) as exc_info:
         await Runner.run(agent, "hello", run_config=_sandbox_run_config(client))

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 from typing import TYPE_CHECKING, Any, cast
 
 from typing_extensions import Unpack
@@ -728,6 +729,7 @@ class AgentRunner:
         run_state: RunState[TContext] | None = (
             cast(RunState[TContext], input) if is_resumed_state else None
         )
+        caller_owned_run_state = run_state
         resolved_reasoning_item_id_policy: ReasoningItemIdPolicy | None = (
             run_config.reasoning_item_id_policy
             if run_config.reasoning_item_id_policy is not None
@@ -950,14 +952,17 @@ class AgentRunner:
                 sandbox_cleanup_cancellation: asyncio.CancelledError | None = None
                 sandbox_cleanup_error: BaseException | None = None
                 sandbox_resume_state_after_cleanup: dict[str, object] | None = None
+                memory_enqueue_cancellation: asyncio.CancelledError | None = None
 
                 def _publish_late_sandbox_resume_state(
                     resume_state: dict[str, object],
                 ) -> None:
                     nonlocal sandbox_resume_state_after_cleanup
                     sandbox_resume_state_after_cleanup = resume_state
+                    if caller_owned_run_state is not None:
+                        caller_owned_run_state._sandbox = copy.deepcopy(resume_state)
                     if completed_result is not None:
-                        completed_result._sandbox_resume_state = resume_state
+                        completed_result._update_sandbox_resume_state(resume_state)
                         return
                     for error in (
                         run_cancellation,
@@ -2367,6 +2372,8 @@ class AgentRunner:
                                 interruptions=approvals_from_step(current_step),
                                 terminal_metadata=terminal_metadata_for_exception(run_exception),
                             )
+                    except asyncio.CancelledError as error:
+                        memory_enqueue_cancellation = error
                     except Exception as error:
                         log_model_and_tool_action_warning(
                             logger, "Failed to enqueue sandbox memory after run", error
@@ -2381,14 +2388,17 @@ class AgentRunner:
                         sandbox_runtime.resume_state_after_cleanup_error
                     )
                     if completed_result is not None:
-                        completed_result._sandbox_resume_state = sandbox_resume_state_after_cleanup
+                        completed_result._update_sandbox_resume_state(
+                            sandbox_resume_state_after_cleanup
+                        )
                     if isinstance(error, asyncio.CancelledError) and (
                         completed_result is None or sandbox_runtime.caller_cancelled_during_cleanup
                     ):
                         sandbox_cleanup_cancellation = error
                 else:
                     if completed_result is not None:
-                        completed_result._sandbox_resume_state = sandbox_resume_state
+                        if sandbox_resume_state is not None:
+                            completed_result._update_sandbox_resume_state(sandbox_resume_state)
                     sandbox_resume_state_after_cleanup = sandbox_resume_state
                 finally:
                     if completed_result is not None:
@@ -2400,6 +2410,7 @@ class AgentRunner:
                         recovery_error = (
                             run_cancellation
                             or sandbox_cleanup_cancellation
+                            or memory_enqueue_cancellation
                             or run_exception
                             or sandbox_cleanup_error
                         )
@@ -2407,6 +2418,8 @@ class AgentRunner:
                             cast(
                                 Any, recovery_error
                             )._sandbox_resume_state = sandbox_resume_state_after_cleanup
+                if memory_enqueue_cancellation is not None and sandbox_cleanup_cancellation is None:
+                    sandbox_cleanup_cancellation = memory_enqueue_cancellation
                 try:
                     await dispose_resolved_computers(
                         run_context=context_wrapper,

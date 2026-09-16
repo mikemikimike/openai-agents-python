@@ -357,6 +357,10 @@ class RunResultBase(abc.ABC):
     """Session item occurrences already represented verbatim in SDK-default nested history."""
     _sandbox_resume_state: dict[str, object] | None = field(default=None, init=False, repr=False)
     """Serialized sandbox session state captured during the run."""
+    _sandbox_state_checkpoints: list[weakref.ReferenceType[RunState[Any]]] = field(
+        default_factory=list, init=False, repr=False
+    )
+    """Live RunState checkpoints that receive late sandbox resume-state updates."""
     _sandbox_session: BaseSandboxSession | None = field(default=None, init=False, repr=False)
     """Live sandbox session attached to this run result when sandbox execution is enabled."""
     _starting_agent_for_state: Agent[Any] | None = field(default=None, init=False, repr=False)
@@ -384,6 +388,17 @@ class RunResultBase(abc.ABC):
     @abc.abstractmethod
     def last_agent(self) -> Agent[Any]:
         """The last agent that was run."""
+
+    def _update_sandbox_resume_state(self, resume_state: dict[str, object] | None) -> None:
+        self._sandbox_resume_state = resume_state
+        live_checkpoints: list[weakref.ReferenceType[RunState[Any]]] = []
+        for checkpoint_ref in self._sandbox_state_checkpoints:
+            checkpoint = checkpoint_ref()
+            if checkpoint is None:
+                continue
+            checkpoint._sandbox = copy.deepcopy(resume_state)
+            live_checkpoints.append(checkpoint_ref)
+        self._sandbox_state_checkpoints = live_checkpoints
 
     def release_agents(self, *, release_new_items: bool = True) -> None:
         """
@@ -589,6 +604,7 @@ class RunResult(RunResultBase):
             auto_previous_response_id=self._auto_previous_response_id,
         )
         _copy_pending_nested_agent_tool_states(state, self)
+        self._sandbox_state_checkpoints.append(weakref.ref(state))
         return state
 
     def __str__(self) -> str:
@@ -1251,4 +1267,5 @@ class RunResultStreaming(RunResultBase):
             auto_previous_response_id=self._auto_previous_response_id,
         )
         _copy_pending_nested_agent_tool_states(state, self)
+        self._sandbox_state_checkpoints.append(weakref.ref(state))
         return state

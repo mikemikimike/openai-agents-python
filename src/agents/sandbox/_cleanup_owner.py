@@ -92,6 +92,12 @@ def force_cancel_cleanup_owner(task: asyncio.Future[Any], msg: object = None) ->
     return asyncio.Task.cancel(task, msg)
 
 
+def cleanup_owner_was_force_cancelled(task: asyncio.Future[Any]) -> bool:
+    """Return whether a cleanup owner was terminated by bounded shutdown."""
+
+    return isinstance(task, _CleanupOwnerTask) and task._force_cancelling
+
+
 def create_cleanup_owner(
     awaitable: Awaitable[_T], *, name: str, cancel_grace_s: float = _DEFAULT_CANCEL_GRACE_S
 ) -> asyncio.Task[_T]:

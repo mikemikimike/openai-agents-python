@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import errno
 import hashlib
 import io
@@ -567,7 +568,6 @@ class DockerSandboxSession(BaseSandboxSession):
         timeout: float | None,
         command_for_errors: tuple[str | Path, ...],
         kill_on_timeout: bool,
-        keep_running_on_timeout: bool = False,
     ) -> ExecResult:
         loop = asyncio.get_running_loop()
         future = loop.run_in_executor(
@@ -579,29 +579,40 @@ class DockerSandboxSession(BaseSandboxSession):
                 user=user or "",
             ),
         )
-        wait_target = asyncio.shield(future) if keep_running_on_timeout else future
+        # Never let wait_for cancel the executor future: a running Docker call still owns a
+        # worker and must remain tracked until it settles.
+        wait_target = asyncio.shield(future)
         try:
             exec_result = await asyncio.wait_for(wait_target, timeout=timeout)
         except asyncio.TimeoutError as e:
-            if keep_running_on_timeout and not future.done():
+            if not future.done():
                 self._track_pty_cleanup_task(future)
             if kill_on_timeout:
-                # Best-effort: kill processes matching the command line.
-                # If this fails, the caller still gets a timeout error.
+                # Docker SDK calls can block on the transport. Keep timeout cleanup off the event
+                # loop and retain ownership if the shared executor is currently saturated.
                 try:
                     pattern = " ".join(str(c) for c in command_for_errors).replace("'", "'\\''")
-                    self._container.exec_run(
-                        cmd=[
-                            "sh",
-                            "-lc",
-                            f"pkill -f -- '{pattern}' >/dev/null 2>&1 || true",
-                        ],
-                        demux=True,
-                        user=user or "",
+                    kill_future = loop.run_in_executor(
+                        _DOCKER_EXECUTOR,
+                        lambda: self._container.exec_run(
+                            cmd=[
+                                "sh",
+                                "-lc",
+                                f"pkill -f -- '{pattern}' >/dev/null 2>&1 || true",
+                            ],
+                            demux=True,
+                            user=user or "",
+                        ),
                     )
                 except Exception:
                     pass
+                else:
+                    self._track_pty_cleanup_task(kill_future)
             raise ExecTimeoutError(command=command_for_errors, timeout_s=timeout, cause=e) from e
+        except asyncio.CancelledError:
+            if not future.done():
+                self._track_pty_cleanup_task(future)
+            raise
         except Exception as e:
             raise ExecTransportError(command=command_for_errors, cause=e) from e
 
@@ -976,6 +987,147 @@ class DockerSandboxSession(BaseSandboxSession):
         raw_sock = getattr(sock, "_sock", sock)
         return _DockerExecSocket(sock=sock, raw_sock=raw_sock, response=response)
 
+    def _schedule_pty_pid_cleanup(self, pid_path: Path) -> None:
+        loop = asyncio.get_running_loop()
+        cleanup_future = self._schedule_late_pty_pid_cleanup(pid_path)
+        if cleanup_future is None:
+            return
+        try:
+            loop_future = asyncio.wrap_future(cleanup_future, loop=loop)
+        except RuntimeError:
+            return
+        self._track_pty_cleanup_task(loop_future)
+
+    def _kill_pty_pid_path_sync(self, pid_path: Path) -> None:
+        command = [
+            "sh",
+            "-lc",
+            (
+                'if [ -f "$1" ]; then '
+                'pid="$(cat "$1" 2>/dev/null || true)"; '
+                'if [ -n "$pid" ]; then '
+                'kill -KILL "$pid" >/dev/null 2>&1 || true; '
+                "fi; "
+                'rm -f -- "$1" >/dev/null 2>&1 || true; '
+                "fi"
+            ),
+            "sh",
+            sandbox_path_str(pid_path),
+        ]
+        result = self._container.exec_run(
+            cmd=command,
+            demux=True,
+            workdir=None,
+            user="",
+        )
+        if getattr(result, "exit_code", 0) not in (0, None):
+            raise RuntimeError(f"Docker PTY PID cleanup exited with {result.exit_code}")
+
+    def _schedule_late_pty_pid_cleanup(
+        self, pid_path: Path
+    ) -> concurrent.futures.Future[None] | None:
+        try:
+            cleanup_future = _DOCKER_EXECUTOR.submit(self._kill_pty_pid_path_sync, pid_path)
+        except Exception as error:
+            log_tool_action_warning(logger, "Failed to schedule late Docker PTY PID cleanup", error)
+            return None
+
+        def observe_cleanup(done: concurrent.futures.Future[None]) -> None:
+            try:
+                done.result()
+            except Exception as error:
+                log_tool_action_warning(logger, "Late Docker PTY PID cleanup failed", error)
+
+        cleanup_future.add_done_callback(observe_cleanup)
+        return cleanup_future
+
+    @staticmethod
+    def _resolve_late_pty_cleanup_guard(
+        loop: asyncio.AbstractEventLoop,
+        guard: asyncio.Future[None],
+    ) -> None:
+        if loop.is_closed():
+            return
+
+        def resolve() -> None:
+            if not guard.done():
+                guard.set_result(None)
+
+        try:
+            loop.call_soon_threadsafe(resolve)
+        except RuntimeError:
+            return
+
+    def _track_late_pty_exec_create(
+        self,
+        future: concurrent.futures.Future[object],
+        loop_future: asyncio.Future[object],
+        *,
+        loop: asyncio.AbstractEventLoop,
+        pid_path: Path,
+    ) -> None:
+        cleanup_guard = loop.create_future()
+        self._track_pty_cleanup_task(cleanup_guard)
+        loop_future.add_done_callback(self._consume_late_pty_loop_future)
+
+        def cleanup_late_result(done: concurrent.futures.Future[object]) -> None:
+            if done.cancelled():
+                return
+            try:
+                done.result()
+            except Exception as error:
+                log_tool_action_warning(
+                    logger, "Docker PTY exec creation failed after timeout", error
+                )
+            cleanup_future = self._schedule_late_pty_pid_cleanup(pid_path)
+            if cleanup_future is None:
+                self._resolve_late_pty_cleanup_guard(loop, cleanup_guard)
+            else:
+                cleanup_future.add_done_callback(
+                    lambda _done: self._resolve_late_pty_cleanup_guard(loop, cleanup_guard)
+                )
+
+        future.add_done_callback(cleanup_late_result)
+
+    def _track_late_pty_exec_start(
+        self,
+        future: concurrent.futures.Future[_DockerExecSocket],
+        loop_future: asyncio.Future[_DockerExecSocket],
+        *,
+        loop: asyncio.AbstractEventLoop,
+        pid_path: Path,
+    ) -> None:
+        cleanup_guard = loop.create_future()
+        self._track_pty_cleanup_task(cleanup_guard)
+        loop_future.add_done_callback(self._consume_late_pty_loop_future)
+
+        def cleanup_late_result(done: concurrent.futures.Future[_DockerExecSocket]) -> None:
+            if done.cancelled():
+                return
+            try:
+                exec_socket = done.result()
+            except Exception as error:
+                log_tool_action_warning(logger, "Docker PTY exec start failed after timeout", error)
+            else:
+                try:
+                    exec_socket.close()
+                except Exception as error:
+                    log_tool_action_warning(logger, "Docker PTY late socket close failed", error)
+            cleanup_future = self._schedule_late_pty_pid_cleanup(pid_path)
+            if cleanup_future is None:
+                self._resolve_late_pty_cleanup_guard(loop, cleanup_guard)
+            else:
+                cleanup_future.add_done_callback(
+                    lambda _done: self._resolve_late_pty_cleanup_guard(loop, cleanup_guard)
+                )
+
+        future.add_done_callback(cleanup_late_result)
+
+    @staticmethod
+    def _consume_late_pty_loop_future(done: asyncio.Future[Any]) -> None:
+        if not done.cancelled():
+            done.exception()
+
     async def pty_exec_start(
         self,
         *command: str | Path,
@@ -1003,10 +1155,16 @@ class DockerSandboxSession(BaseSandboxSession):
         pruned_entry: _DockerPtyProcessEntry | None = None
         process_id = 0
         process_count = 0
+        exec_create_future: asyncio.Future[object] | None = None
+        exec_create_source: concurrent.futures.Future[object] | None = None
+        exec_start_future: asyncio.Future[_DockerExecSocket] | None = None
+        exec_start_source: concurrent.futures.Future[_DockerExecSocket] | None = None
 
         try:
             pty_pid_path = self._archive_stage_path(name_hint="pty.pid")
             await self._prepare_user_pty_pid_path(path=pty_pid_path, user=docker_user)
+            assert pty_pid_path is not None
+            pid_path = pty_pid_path
             wrapped_cmd = [
                 "sh",
                 "-lc",
@@ -1016,28 +1174,30 @@ class DockerSandboxSession(BaseSandboxSession):
                 sandbox_path_str(pty_pid_path),
                 *cmd,
             ]
-            resp = await asyncio.wait_for(
-                loop.run_in_executor(
-                    _DOCKER_EXECUTOR,
-                    lambda: api.exec_create(
-                        self._container.id,
-                        wrapped_cmd,
-                        stdin=True,
-                        stdout=True,
-                        stderr=True,
-                        tty=tty,
-                        workdir=workdir,
-                        user=docker_user or "",
-                    ),
+            exec_create_source = _DOCKER_EXECUTOR.submit(
+                lambda: api.exec_create(
+                    self._container.id,
+                    wrapped_cmd,
+                    stdin=True,
+                    stdout=True,
+                    stderr=True,
+                    tty=tty,
+                    workdir=workdir,
+                    user=docker_user or "",
                 ),
+            )
+            exec_create_future = asyncio.wrap_future(exec_create_source, loop=loop)
+            resp = await asyncio.wait_for(
+                asyncio.shield(exec_create_future),
                 timeout=timeout,
             )
-            exec_id = cast(str, resp["Id"])
+            exec_id = cast(str, cast(dict[str, object], resp)["Id"])
+            exec_start_source = _DOCKER_EXECUTOR.submit(
+                lambda: self._start_exec_socket(api=api, exec_id=exec_id, tty=tty),
+            )
+            exec_start_future = asyncio.wrap_future(exec_start_source, loop=loop)
             exec_socket = await asyncio.wait_for(
-                loop.run_in_executor(
-                    _DOCKER_EXECUTOR,
-                    lambda: self._start_exec_socket(api=api, exec_id=exec_id, tty=tty),
-                ),
+                asyncio.shield(exec_start_future),
                 timeout=timeout,
             )
             raw_sock = exec_socket.raw_sock
@@ -1070,20 +1230,59 @@ class DockerSandboxSession(BaseSandboxSession):
                 process_count = len(self._pty_processes)
                 registered = True
         except asyncio.TimeoutError as e:
+            if exec_start_source is not None and exec_start_future is not None:
+                self._track_late_pty_exec_start(
+                    exec_start_source,
+                    exec_start_future,
+                    loop=loop,
+                    pid_path=pid_path,
+                )
+            elif exec_create_source is not None and exec_create_future is not None:
+                self._track_late_pty_exec_create(
+                    exec_create_source,
+                    exec_create_future,
+                    loop=loop,
+                    pid_path=pid_path,
+                )
             if entry is not None and not registered:
                 await self._terminate_pty_entry(entry)
             elif pty_pid_path is not None:
                 await self._kill_pty_pid_path(pty_pid_path)
             raise ExecTimeoutError(command=command, timeout_s=timeout, cause=e) from e
         except Exception as e:
-            if entry is not None and not registered:
-                await self._terminate_pty_entry(entry)
+            try:
+                if entry is not None and not registered:
+                    await self._terminate_pty_entry(entry)
+                elif pty_pid_path is not None:
+                    await self._kill_pty_pid_path(pty_pid_path)
+            except Exception as cleanup_error:
+                log_tool_action_warning(
+                    logger,
+                    "Failed to clean up Docker PTY after startup failure",
+                    cleanup_error,
+                )
             raise ExecTransportError(
                 command=command,
                 context={"retry_safe": True},
                 cause=e,
             ) from e
         except BaseException:
+            if exec_start_source is not None and exec_start_future is not None:
+                self._track_late_pty_exec_start(
+                    exec_start_source,
+                    exec_start_future,
+                    loop=loop,
+                    pid_path=pid_path,
+                )
+            elif exec_create_source is not None and exec_create_future is not None:
+                self._track_late_pty_exec_create(
+                    exec_create_source,
+                    exec_create_future,
+                    loop=loop,
+                    pid_path=pid_path,
+                )
+            elif pty_pid_path is not None:
+                self._schedule_pty_pid_cleanup(pty_pid_path)
             if entry is not None and not registered:
                 await self._terminate_pty_entry(entry)
             raise
@@ -1231,11 +1430,18 @@ class DockerSandboxSession(BaseSandboxSession):
         api = container_client.api
 
         while True:
+            inspect_future = loop.run_in_executor(
+                _DOCKER_EXECUTOR,
+                lambda: api.exec_inspect(entry.exec_id),
+            )
             try:
-                inspect_result = await loop.run_in_executor(
-                    _DOCKER_EXECUTOR,
-                    lambda: api.exec_inspect(entry.exec_id),
-                )
+                inspect_result = await asyncio.shield(inspect_future)
+            except asyncio.CancelledError:
+                if not inspect_future.done():
+                    self._track_pty_cleanup_task(inspect_future)
+                else:
+                    self._observe_pty_exit_inspection_result(inspect_future)
+                raise
             except Exception as error:
                 log_tool_action_warning(logger, "Docker PTY exit watcher failed", error)
                 break
@@ -1447,7 +1653,6 @@ class DockerSandboxSession(BaseSandboxSession):
                 timeout=_PTY_CLEANUP_TIMEOUT_S,
                 command_for_errors=("kill", sandbox_path_str(pid_path)),
                 kill_on_timeout=False,
-                keep_running_on_timeout=True,
             ),
             name="agents.docker_pty_kill",
         )

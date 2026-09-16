@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agents.sandbox._cleanup_owner import create_cleanup_owner, force_cancel_cleanup_owner
 from agents.sandbox.manifest import Manifest
 from agents.sandbox.session import base_sandbox_session
 from agents.sandbox.session.base_sandbox_session import BaseSandboxSession
@@ -214,7 +215,66 @@ def test_asyncio_run_shutdown_has_bounded_cleanup_owner() -> None:
         thread.join(timeout=2)
 
 
-def test_asyncio_run_propagates_forced_shutdown_from_deferred_cleanup_waiter(
+@pytest.mark.asyncio
+async def test_forced_cleanup_cancellation_stops_before_snapshot_follow_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _session()
+    session.state = SimpleNamespace(manifest=Manifest(), type="test")
+    monkeypatch.setattr(
+        base_sandbox_session,
+        "validate_manifest_mount_credential_boundaries",
+        lambda *args, **kwargs: None,
+    )
+    snapshot_started = asyncio.Event()
+    release_snapshot = asyncio.Event()
+    snapshot_finished = asyncio.Event()
+    shutdown_called = False
+
+    async def before_stop() -> None:
+        raise RuntimeError("stop cleanup failed")
+
+    async def persist_snapshot() -> None:
+        snapshot_started.set()
+        try:
+            await release_snapshot.wait()
+        finally:
+            snapshot_finished.set()
+
+    async def shutdown_backend() -> None:
+        nonlocal shutdown_called
+        shutdown_called = True
+
+    session._before_stop = before_stop
+    session._persist_snapshot = persist_snapshot
+    session._shutdown_backend = shutdown_backend
+
+    owner = create_cleanup_owner(
+        session.stop(),
+        name="tests.forced_snapshot_cleanup",
+        cancel_grace_s=0.1,
+    )
+    try:
+        await asyncio.wait_for(snapshot_started.wait(), timeout=0.5)
+        assert force_cancel_cleanup_owner(owner)
+        await asyncio.sleep(0)
+        assert owner.done()
+        assert not shutdown_called
+
+        release_snapshot.set()
+        snapshot_task = session._snapshot_persistence_task
+        assert snapshot_task is not None
+        await asyncio.wait_for(snapshot_finished.wait(), timeout=0.5)
+        await asyncio.gather(snapshot_task, return_exceptions=True)
+    finally:
+        release_snapshot.set()
+        if not owner.done():
+            force_cancel_cleanup_owner(owner)
+        await asyncio.gather(owner, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_asyncio_run_propagates_forced_shutdown_from_deferred_cleanup_waiter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     create_cleanup_owner = base_sandbox_session.create_cleanup_owner
@@ -265,8 +325,10 @@ async def test_pty_cleanup_preserves_cleanup_exception() -> None:
         task.cancel()
         release.set()
 
-        with pytest.raises(RuntimeError, match="cleanup failed"):
+        with pytest.raises(asyncio.CancelledError) as exc_info:
             await task
+        assert isinstance(exc_info.value.__cause__, RuntimeError)
+        assert str(exc_info.value.__cause__) == "cleanup failed"
     finally:
         release.set()
         if not task.done():
@@ -481,6 +543,45 @@ async def test_stop_does_not_snapshot_while_pty_cleanup_is_still_pending(
 
 
 @pytest.mark.asyncio
+async def test_stop_waits_for_tracked_cleanup_before_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _session()
+    session.state = SimpleNamespace(manifest=Manifest(), type="test")
+    monkeypatch.setattr(
+        base_sandbox_session,
+        "validate_manifest_mount_credential_boundaries",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(session, "_pty_cleanup_timeout_s", lambda: 0.01)
+    release_cleanup = asyncio.Event()
+    snapshot_started = asyncio.Event()
+
+    async def pending_cleanup() -> None:
+        await release_cleanup.wait()
+
+    async def before_stop() -> None:
+        return
+
+    async def persist_snapshot() -> None:
+        snapshot_started.set()
+
+    session._track_pty_cleanup_task(asyncio.create_task(pending_cleanup()))
+    session._before_stop = before_stop
+    session._persist_snapshot = persist_snapshot
+
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await inspect.unwrap(BaseSandboxSession.stop)(session)
+
+        assert not snapshot_started.is_set()
+        assert session._should_preserve_backend_on_cleanup()
+    finally:
+        release_cleanup.set()
+        await session._wait_for_tracked_cleanup_tasks(timeout=0.5)
+
+
+@pytest.mark.asyncio
 async def test_aclose_defers_shutdown_until_fallback_snapshot_finishes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -589,6 +690,50 @@ async def test_aclose_keeps_dependencies_open_after_immediate_fallback_snapshot_
     assert session.snapshot_calls == 2
     assert session.shutdown_calls == 1
     assert dependency.closed
+    assert session._dependencies_closed
+
+
+@pytest.mark.asyncio
+async def test_aclose_keeps_dependencies_open_after_snapshot_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RetryableSnapshotSession(_Session):
+        def __init__(self) -> None:
+            self.state = SimpleNamespace(manifest=Manifest(), type="test")
+            self.snapshot_calls = 0
+            self.shutdown_calls = 0
+
+        async def _before_stop(self) -> None:
+            return
+
+        async def stop(self) -> None:
+            await inspect.unwrap(BaseSandboxSession.stop)(self)
+
+        async def _persist_snapshot(self) -> None:
+            self.snapshot_calls += 1
+            if self.snapshot_calls == 1:
+                raise RuntimeError("snapshot failed")
+
+        async def _shutdown_backend(self) -> None:
+            self.shutdown_calls += 1
+
+    session = RetryableSnapshotSession()
+    _ = session.dependencies
+    monkeypatch.setattr(
+        base_sandbox_session,
+        "validate_manifest_mount_credential_boundaries",
+        lambda *args, **kwargs: None,
+    )
+
+    with pytest.raises(RuntimeError, match="snapshot failed"):
+        await inspect.unwrap(BaseSandboxSession.aclose)(session)
+
+    assert session._should_preserve_backend_on_cleanup()
+    assert not session._dependencies_closed
+    await inspect.unwrap(BaseSandboxSession.aclose)(session)
+
+    assert session.snapshot_calls == 2
+    assert session.shutdown_calls == 1
     assert session._dependencies_closed
 
 

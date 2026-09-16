@@ -120,7 +120,7 @@ class SandboxRuntime(Generic[TContext]):
         session = self.current_session
         result._sandbox_session = session
         self._session_manager.register_resume_state_observer(
-            lambda resume_state: setattr(result, "_sandbox_resume_state", resume_state)
+            lambda resume_state: result._update_sandbox_resume_state(resume_state)
         )
         if isinstance(result, RunResultStreaming):
 
@@ -140,10 +140,14 @@ class SandboxRuntime(Generic[TContext]):
                     try:
                         payload = await self.cleanup()
                     except BaseException:
-                        result._sandbox_resume_state = self.resume_state_after_cleanup_error
+                        if self.resume_state_after_cleanup_error is not None:
+                            result._update_sandbox_resume_state(
+                                self.resume_state_after_cleanup_error
+                            )
                         raise
                     else:
-                        result._sandbox_resume_state = payload
+                        if payload is not None:
+                            result._update_sandbox_resume_state(payload)
                 finally:
                     result._sandbox_session = None
 

@@ -417,6 +417,14 @@ class BaseSandboxSession(abc.ABC):
         try:
             try:
                 await self._before_stop()
+                if self._has_pending_pty_cleanup_tasks(exclude_snapshot=True):
+                    caller_cancellation, timed_out = await self._wait_for_tracked_cleanup_tasks(
+                        timeout=self._pty_cleanup_timeout_s()
+                    )
+                    if caller_cancellation is not None:
+                        raise caller_cancellation
+                    if timed_out:
+                        raise asyncio.TimeoutError()
             except BaseException as before_stop_error:
                 # Persist before re-raising cancellation or a cleanup deadline/error so the
                 # backend cannot be deleted with workspace state that exists only remotely.
@@ -448,6 +456,9 @@ class BaseSandboxSession(abc.ABC):
                     if wrapped is not before_stop_error:
                         raise wrapped from before_stop_error
                 raise
+            # A failed ordinary snapshot is also unrecoverable by backend deletion. Keep the
+            # backend and dependencies alive until a later stop retry proves persistence.
+            self._backend_preservation_required = True
             try:
                 snapshot_task = self._snapshot_persistence_task
                 if snapshot_task is not None and not snapshot_task.done():
@@ -503,12 +514,14 @@ class BaseSandboxSession(abc.ABC):
             try:
                 await asyncio.wait((snapshot_task,), timeout=remaining)
             except asyncio.CancelledError as error:
+                raise_if_cleanup_owner_force_cancelling(error, nested_tasks=(snapshot_task,))
                 caller_cancellation = caller_cancellation or error
 
         if snapshot_task.done():
             try:
                 snapshot_task.result()
             except BaseException as error:
+                raise_if_cleanup_owner_force_cancelling(error, nested_tasks=(snapshot_task,))
                 if caller_cancellation is not None:
                     raise caller_cancellation from before_stop_error
                 return error
@@ -708,6 +721,9 @@ class BaseSandboxSession(abc.ABC):
             self._dependencies_close_task = None
         return dependencies
 
+    def _has_open_dependencies(self) -> bool:
+        return self._dependencies is not None and not self._dependencies_closed
+
     def set_dependencies(self, dependencies: Dependencies | None) -> None:
         if dependencies is None:
             return
@@ -779,8 +795,12 @@ class BaseSandboxSession(abc.ABC):
 
         return
 
-    def _has_pending_pty_cleanup_tasks(self) -> bool:
-        return any(task for task in (self._pty_cleanup_tasks or ()) if not task.done())
+    def _has_pending_pty_cleanup_tasks(self, *, exclude_snapshot: bool = False) -> bool:
+        snapshot_task = self._snapshot_persistence_task if exclude_snapshot else None
+        return any(
+            task is not snapshot_task and not task.done()
+            for task in (self._pty_cleanup_tasks or ())
+        )
 
     def _has_pending_dependency_close_task(self) -> bool:
         task = self._dependencies_close_task
@@ -1104,9 +1124,18 @@ class BaseSandboxSession(abc.ABC):
                 caller_cancellation = caller_cancellation or error
 
         if task.done():
-            task.result()
+            cleanup_error: BaseException | None = None
+            try:
+                task.result()
+            except BaseException as error:
+                raise_if_cleanup_owner_force_cancelling(error, nested_tasks=(task,))
+                cleanup_error = error
             if caller_cancellation is not None:
+                if cleanup_error is not None:
+                    raise caller_cancellation from cleanup_error
                 raise caller_cancellation
+            if cleanup_error is not None:
+                raise cleanup_error
         elif caller_cancellation is not None:
             raise caller_cancellation
         elif timed_out and propagate_timeout:
@@ -1200,6 +1229,7 @@ class BaseSandboxSession(abc.ABC):
                 try:
                     task.result()
                 except BaseException as error:
+                    raise_if_cleanup_owner_force_cancelling(error, nested_tasks=(task,))
                     cleanup_errors.setdefault(index, error)
         if caller_cancellation is not None:
             cleanup_error = cleanup_errors.get(min(cleanup_errors)) if cleanup_errors else None
