@@ -149,6 +149,7 @@ class SandboxRuntime(Generic[TContext]):
         if isinstance(result, RunResultStreaming):
 
             async def _cleanup_and_store() -> None:
+                result._set_sandbox_resume_state_pending(True)
                 try:
                     try:
                         await self.enqueue_memory_result(
@@ -182,6 +183,7 @@ class SandboxRuntime(Generic[TContext]):
         else:
 
             async def _cleanup_and_store() -> None:
+                result._set_sandbox_resume_state_pending(True)
                 try:
                     payload = await self.cleanup()
                 except BaseException:

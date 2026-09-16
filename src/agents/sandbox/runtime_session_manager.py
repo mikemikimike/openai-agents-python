@@ -409,6 +409,7 @@ class SandboxRuntimeSessionManager(Generic[TContext]):
         self._claimed_resumed_keys: set[str] = set()
         self._deferred_cleanup_tasks: set[asyncio.Task[Any]] = set()
         self._pending_resource_cleanup_tasks: set[asyncio.Task[Any]] = set()
+        self._cleanup_started = False
         self._cleanup_finished = False
         self._caller_cancelled_during_cleanup = False
         self._preserved_backend_retry_required = False
@@ -456,8 +457,10 @@ class SandboxRuntimeSessionManager(Generic[TContext]):
 
     @property
     def cleanup_has_pending_work(self) -> bool:
-        if not self._cleanup_finished:
+        if not self._cleanup_started:
             return False
+        if not self._cleanup_finished:
+            return True
         return bool(self._pending_resource_cleanup_tasks or self._deferred_cleanup_tasks) or any(
             resources.session._has_pending_pty_cleanup_tasks()
             for resources in self._resources_by_agent.values()
@@ -595,6 +598,7 @@ class SandboxRuntimeSessionManager(Generic[TContext]):
             cleanup_error: BaseException | None = None
             caller_cancellation: asyncio.CancelledError | None = None
             resume_state: dict[str, object] | None = None
+            self._cleanup_started = True
             self._cleanup_finished = False
             self._caller_cancelled_during_cleanup = False
             self._preserved_backend_retry_required = False

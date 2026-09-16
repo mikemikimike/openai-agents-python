@@ -3656,6 +3656,42 @@ async def test_runner_streamed_cleans_runner_owned_session() -> None:
 
 
 @pytest.mark.asyncio
+async def test_runner_streamed_blocks_checkpoint_during_cleanup() -> None:
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+
+    class DelayedCleanupSession(_FakeSession):
+        async def stop(self) -> None:
+            cleanup_started.set()
+            await release_cleanup.wait()
+            await super().stop()
+
+    session = DelayedCleanupSession(Manifest())
+    client = _FakeClient(session)
+    agent = SandboxAgent(
+        name="sandbox",
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
+        instructions="Base instructions.",
+    )
+    result = Runner.run_streamed(agent, "hello", run_config=_sandbox_run_config(client))
+
+    async def consume_events() -> None:
+        async for _event in result.stream_events():
+            pass
+
+    consume_task = asyncio.create_task(consume_events())
+    try:
+        await asyncio.wait_for(cleanup_started.wait(), timeout=0.5)
+        with pytest.raises(RuntimeError, match="sandbox cleanup is still settling"):
+            result.to_state()
+    finally:
+        release_cleanup.set()
+
+    await asyncio.wait_for(consume_task, timeout=0.5)
+    assert result.to_state().to_json()["sandbox"] is not None
+
+
+@pytest.mark.asyncio
 async def test_runner_streamed_guardrail_trip_blocks_runner_owned_sandbox_creation() -> None:
     session = _FakeSession(Manifest())
     client = _FakeClient(session)
