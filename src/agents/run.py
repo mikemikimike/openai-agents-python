@@ -182,6 +182,15 @@ from .util import _error_tracing
 DEFAULT_AGENT_RUNNER: AgentRunner = None  # type: ignore
 # the value is set at the end of the module
 
+
+def _reject_pending_sandbox_resume_state(run_state: RunState[Any]) -> None:
+    if run_state._sandbox_resume_state_pending:
+        raise UserError(
+            "Cannot resume RunState while sandbox cleanup is still settling; retry after "
+            "the sandbox cleanup completes."
+        )
+
+
 __all__ = [
     "AgentRunner",
     "Runner",
@@ -736,6 +745,7 @@ class AgentRunner:
             else (run_state._reasoning_item_id_policy if run_state is not None else None)
         )
         if run_state is not None:
+            _reject_pending_sandbox_resume_state(run_state)
             run_state._reasoning_item_id_policy = resolved_reasoning_item_id_policy
         starting_input = input if not is_resumed_state else None
         original_user_input: str | list[TResponseInputItem] | None = None
@@ -2427,6 +2437,16 @@ class AgentRunner:
                             )._sandbox_resume_state = sandbox_resume_state_after_cleanup
                 if memory_enqueue_cancellation is not None and sandbox_cleanup_cancellation is None:
                     sandbox_cleanup_cancellation = memory_enqueue_cancellation
+                if completed_result is None:
+                    recovery_error = (
+                        run_cancellation
+                        or sandbox_cleanup_cancellation
+                        or memory_enqueue_cancellation
+                        or run_exception
+                        or sandbox_cleanup_error
+                    )
+                    if recovery_error is not None:
+                        sandbox_runtime.transfer_cleanup_ownership(recovery_error)
                 try:
                     await dispose_resolved_computers(
                         run_context=context_wrapper,
@@ -2469,6 +2489,9 @@ class AgentRunner:
                 redacted_error = _prepare_data_redacted_error(redacted_source)
                 if sandbox_resume_state is not None:
                     cast(Any, redacted_error)._sandbox_resume_state = sandbox_resume_state
+                sandbox_cleanup = getattr(redacted_source, "_sandbox_cleanup", None)
+                if sandbox_cleanup is not None:
+                    cast(Any, redacted_error)._sandbox_cleanup = sandbox_cleanup
             else:
                 _detach_data_redacted_error_traceback(redacted_source)
                 redacted_error = redacted_source
@@ -2615,6 +2638,7 @@ class AgentRunner:
 
         if is_resumed_state:
             run_state = cast(RunState[TContext], input)
+            _reject_pending_sandbox_resume_state(run_state)
             (
                 conversation_id,
                 previous_response_id,

@@ -136,6 +136,25 @@ class SandboxRuntime(Generic[TContext]):
         result._sandbox_session = None
         result._set_sandbox_resume_state_pending(False)
 
+    def transfer_cleanup_ownership(self, carrier: object) -> None:
+        """Keep incomplete cleanup reachable when no run result was constructed."""
+
+        if not self.runner_ownership_requires_transfer:
+            return
+        carrier_any = cast(Any, carrier)
+
+        def update_carrier_resume_state(resume_state: dict[str, object]) -> None:
+            carrier_any._sandbox_resume_state = resume_state
+
+        self._session_manager.register_resume_state_observer(update_carrier_resume_state)
+
+        def clear_carrier_cleanup() -> None:
+            carrier_any._sandbox_cleanup = None
+
+        self._session_manager.register_cleanup_finalization_observer(clear_carrier_cleanup)
+        self._session_manager.detach_runner_agent_guards()
+        carrier_any._sandbox_cleanup = self.cleanup
+
     def apply_result_metadata(self, result: RunResult | RunResultStreaming) -> None:
         session = self.current_session
         result._sandbox_session = session

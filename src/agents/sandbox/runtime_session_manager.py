@@ -500,7 +500,7 @@ class SandboxRuntimeSessionManager(Generic[TContext]):
 
         if self._resume_state_after_cleanup_error is not None:
             observer(self._resume_state_after_cleanup_error)
-        elif (
+        if (
             not self._cleanup_finished
             or self._pending_resource_cleanup_tasks
             or self._deferred_cleanup_tasks
@@ -821,6 +821,12 @@ class SandboxRuntimeSessionManager(Generic[TContext]):
             if dependency_close_tasks:
                 return
 
+            # A failed cleanup may have no open dependencies, but the preserved backend still
+            # needs an owner that can retry stop/snapshot/delete. Keep the resource graph alive
+            # until a later cleanup attempt proves that the backend is gone.
+            if self._preserved_backend_retry_required:
+                return
+
         self._resources_by_agent.clear()
         self._current_agent_id = None
         self._resume_state_observers.clear()
@@ -833,14 +839,26 @@ class SandboxRuntimeSessionManager(Generic[TContext]):
     def _track_deferred_cleanup_task(self, task: asyncio.Task[Any]) -> None:
         if task.done():
             if not task.cancelled():
-                task.exception()
+                error = task.exception()
+                if error is not None:
+                    log_tool_action_error(
+                        logger,
+                        "Deferred sandbox cleanup failed",
+                        error,
+                    )
             self._maybe_finalize_cleanup_state()
             return
         self._deferred_cleanup_tasks.add(task)
 
         def release_agents_after_cleanup(done: asyncio.Task[Any]) -> None:
             if not done.cancelled():
-                done.exception()
+                error = done.exception()
+                if error is not None:
+                    log_tool_action_error(
+                        logger,
+                        "Deferred sandbox cleanup failed",
+                        error,
+                    )
             self._deferred_cleanup_tasks.discard(done)
             self._maybe_finalize_cleanup_state()
 

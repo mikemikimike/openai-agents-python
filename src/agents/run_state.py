@@ -945,6 +945,20 @@ class RunState(Generic[TContext, TAgent]):
 
         self._agent_tool_state_scope_id = get_agent_tool_state_scope(context)
 
+    def _update_sandbox_resume_state(
+        self,
+        resume_state: Mapping[str, object] | None,
+        *,
+        pending: bool,
+    ) -> None:
+        """Update a live checkpoint after sandbox cleanup publishes a new resume state."""
+
+        self._sandbox = copy.deepcopy(resume_state) if resume_state is not None else None
+        self._sandbox_resume_state_pending = pending
+
+    def _set_sandbox_resume_state_pending(self, pending: bool) -> None:
+        self._sandbox_resume_state_pending = pending
+
     def _copy_for_result_checkpoint(self) -> RunState[TContext, TAgent]:
         """Copy SDK-owned decision state when nesting this checkpoint in a result snapshot."""
         copied = copy.copy(self)

@@ -284,6 +284,21 @@ class _CancelledPreservingStopSession(_FakeSession):
         raise asyncio.CancelledError("stop cancelled while preserving backend")
 
 
+class _CancelledThenRetryablePreservingStopSession(_FakeSession):
+    def __init__(self, manifest: Manifest) -> None:
+        super().__init__(manifest)
+        self.stop_attempts = 0
+
+    async def stop(self) -> None:
+        self.stop_attempts += 1
+        self.stop_calls += 1
+        self._running = False
+        if self.stop_attempts == 1:
+            self._backend_preservation_required = True
+            raise asyncio.CancelledError("stop cancelled while preserving backend")
+        self._backend_preservation_required = False
+
+
 class _DelayedPreservingStopSession(_FakeSession):
     def __init__(self, manifest: Manifest, release: asyncio.Event) -> None:
         super().__init__(manifest)
@@ -1605,7 +1620,8 @@ async def test_session_manager_serializes_preserved_backend_from_non_current_age
     sessions_by_agent = cast(dict[str, dict[str, object]], resume_state["sessions_by_agent"])
     assert set(sessions_by_agent) == {preserved_agent.name, current_agent.name}
     assert client.delete_calls == 1
-    assert manager._acquired_agents == {}
+    assert manager._acquired_agents
+    assert manager._resources_by_agent
 
 
 @pytest.mark.asyncio
@@ -4643,7 +4659,7 @@ async def test_runner_keeps_sandbox_resume_state_when_cleanup_preserves_backend(
     assert result._sandbox_resume_state is not None
     assert result._sandbox_resume_state["backend_id"] == "fake"
     assert state._sandbox == result._sandbox_resume_state
-    assert result._sandbox_session is None
+    assert result._sandbox_session is not None
     assert client.delete_calls == 0
 
 
@@ -4875,6 +4891,111 @@ def test_late_sandbox_resume_state_updates_emitted_run_state_checkpoint() -> Non
     assert checkpoint._sandbox == late_state
     assert checkpoint._sandbox is not late_state
 
+    result._set_sandbox_resume_state_pending(True)
+    with pytest.raises(UserError, match="sandbox cleanup is still settling"):
+        checkpoint.to_json()
+
+    result._update_sandbox_resume_state({"backend_id": "latest"})
+    assert checkpoint.to_json()["sandbox"] == {"backend_id": "latest"}
+
+
+@pytest.mark.asyncio
+async def test_runner_rejects_pending_sandbox_state_before_resume() -> None:
+    agent = SandboxAgent(name="sandbox", model=ScriptedModel(), instructions="Sandbox.")
+    state = RunState(
+        context=RunContextWrapper(context=None),
+        original_input="hello",
+        starting_agent=agent,
+    )
+    state._sandbox_resume_state_pending = True
+
+    with pytest.raises(UserError, match="sandbox cleanup is still settling"):
+        await Runner.run(agent, state)
+
+    with pytest.raises(UserError, match="sandbox cleanup is still settling"):
+        Runner.run_streamed(agent, state)
+
+
+@pytest.mark.asyncio
+async def test_streamed_result_aclose_joins_active_sandbox_cleanup() -> None:
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_calls = 0
+
+    result = RunResultStreaming(
+        input="hello",
+        new_items=[],
+        raw_responses=[],
+        final_output=None,
+        input_guardrail_results=[],
+        output_guardrail_results=[],
+        tool_input_guardrail_results=[],
+        tool_output_guardrail_results=[],
+        context_wrapper=RunContextWrapper(context=None),
+        current_agent=Agent(name="sandbox"),
+        current_turn=0,
+        max_turns=1,
+        _current_agent_output_schema=None,
+        trace=None,
+    )
+
+    async def cleanup() -> None:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        cleanup_started.set()
+        await release_cleanup.wait()
+
+    result._sandbox_cleanup = cleanup
+    running_cleanup = asyncio.create_task(result._run_sandbox_cleanup())
+    try:
+        await cleanup_started.wait()
+        close_task = asyncio.create_task(result.aclose())
+        await asyncio.sleep(0)
+        assert not close_task.done()
+        assert cleanup_calls == 1
+
+        release_cleanup.set()
+        await close_task
+        await running_cleanup
+        assert cleanup_calls == 1
+    finally:
+        release_cleanup.set()
+        await asyncio.gather(running_cleanup, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_streamed_result_aclose_retries_finished_incomplete_cleanup() -> None:
+    cleanup_calls = 0
+
+    result = RunResultStreaming(
+        input="hello",
+        new_items=[],
+        raw_responses=[],
+        final_output=None,
+        input_guardrail_results=[],
+        output_guardrail_results=[],
+        tool_input_guardrail_results=[],
+        tool_output_guardrail_results=[],
+        context_wrapper=RunContextWrapper(context=None),
+        current_agent=Agent(name="sandbox"),
+        current_turn=0,
+        max_turns=1,
+        _current_agent_output_schema=None,
+        trace=None,
+    )
+
+    async def cleanup() -> None:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+
+    result._sandbox_cleanup = cleanup
+    await result._run_sandbox_cleanup()
+    assert cleanup_calls == 1
+
+    await result.aclose()
+
+    assert cleanup_calls == 2
+
 
 @pytest.mark.asyncio
 async def test_runner_exposes_sandbox_resume_state_when_cancelled_before_result() -> None:
@@ -4892,7 +5013,32 @@ async def test_runner_exposes_sandbox_resume_state_when_cancelled_before_result(
     resume_state = getattr(exc_info.value, "_sandbox_resume_state", None)
     assert resume_state is not None
     assert resume_state["backend_id"] == "fake"
+    assert getattr(exc_info.value, "_sandbox_cleanup", None) is not None
+    assert agent._sandbox_concurrency_guard is not None
+    assert agent._sandbox_concurrency_guard.active_runs == 0
     assert client.delete_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_runner_cancellation_carrier_can_retry_preserved_cleanup() -> None:
+    session = _CancelledThenRetryablePreservingStopSession(Manifest())
+    client = _FakeClient(session)
+    agent = SandboxAgent(
+        name="sandbox",
+        model=_CancelledRunModel(asyncio.CancelledError("run cancelled")),
+        instructions="Base instructions.",
+    )
+
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        await Runner.run(agent, "hello", run_config=_sandbox_run_config(client))
+
+    cleanup = getattr(exc_info.value, "_sandbox_cleanup", None)
+    assert cleanup is not None
+    await cleanup()
+
+    assert session.stop_attempts == 2
+    assert client.delete_calls == 1
+    assert getattr(exc_info.value, "_sandbox_cleanup", None) is None
 
 
 @pytest.mark.asyncio
@@ -4958,7 +5104,7 @@ async def test_runner_keeps_sandbox_resume_state_when_non_streamed_cleanup_is_ca
     assert result._sandbox_resume_state is not None
     assert result._sandbox_resume_state["backend_id"] == "fake"
     assert state._sandbox == result._sandbox_resume_state
-    assert result._sandbox_session is None
+    assert result._sandbox_session is not None
     assert client.delete_calls == 0
 
 
@@ -5083,7 +5229,7 @@ async def test_runner_streamed_keeps_sandbox_resume_state_when_cleanup_preserves
     assert result.final_output == "done"
     assert result._sandbox_resume_state is not None
     assert result._sandbox_resume_state["backend_id"] == "fake"
-    assert result._sandbox_session is None
+    assert result._sandbox_session is not None
     assert client.delete_calls == 0
 
 
@@ -5103,7 +5249,7 @@ async def test_runner_streamed_keeps_resume_state_when_cleanup_is_cancelled() ->
 
     assert result._sandbox_resume_state is not None
     assert result._sandbox_resume_state["backend_id"] == "fake"
-    assert result._sandbox_session is None
+    assert result._sandbox_session is not None
     assert client.delete_calls == 0
 
 

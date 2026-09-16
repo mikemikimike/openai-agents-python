@@ -408,8 +408,7 @@ class RunResultBase(abc.ABC):
             checkpoint = checkpoint_ref()
             if checkpoint is None:
                 continue
-            checkpoint._sandbox = copy.deepcopy(resume_state)
-            checkpoint._sandbox_resume_state_pending = pending
+            checkpoint._update_sandbox_resume_state(resume_state, pending=pending)
             live_checkpoints.append(checkpoint_ref)
         self._sandbox_state_checkpoints = live_checkpoints
 
@@ -418,7 +417,7 @@ class RunResultBase(abc.ABC):
         for checkpoint_ref in self._sandbox_state_checkpoints:
             checkpoint = checkpoint_ref()
             if checkpoint is not None:
-                checkpoint._sandbox_resume_state_pending = pending
+                checkpoint._set_sandbox_resume_state_pending(pending)
 
     async def aclose(self) -> None:
         """Retry runner-owned sandbox cleanup when the initial cleanup was incomplete."""
@@ -798,31 +797,62 @@ class RunResultStreaming(RunResultBase):
         # Preserve dataclass field so repr/asdict continue to succeed.
         self.__dict__["current_agent"] = None
 
-    async def _run_sandbox_cleanup(self) -> None:
+    async def _perform_sandbox_cleanup(self) -> None:
         sandbox_cleanup = self._sandbox_cleanup
         if sandbox_cleanup is None:
             return
+        try:
+            await sandbox_cleanup()
+        except asyncio.CancelledError as error:
+            self._sandbox_cleanup_cancellation = error
+            raise
+        except Exception as error:
+            log_tool_action_warning(
+                logger,
+                "Failed to clean up sandbox resources after streamed run",
+                error,
+            )
+
+    def _start_sandbox_cleanup(self) -> asyncio.Task[None] | None:
+        task = self._sandbox_cleanup_task
+        if task is not None:
+            return task
+        if self._sandbox_cleanup is None:
+            return None
+        task = asyncio.create_task(self._perform_sandbox_cleanup())
+        self._sandbox_cleanup_task = task
+        return task
+
+    async def _run_sandbox_cleanup(self) -> None:
+        task = self._start_sandbox_cleanup()
+        if task is not None:
+            await task
+
+    async def aclose(self) -> None:
+        """Join automatic streamed cleanup before starting a cleanup retry."""
 
         task = self._sandbox_cleanup_task
-        if task is None:
-
-            async def _cleanup_once() -> None:
-                try:
-                    await sandbox_cleanup()
-                except asyncio.CancelledError as error:
-                    self._sandbox_cleanup_cancellation = error
+        if task is not None:
+            task_was_active = not task.done()
+            try:
+                # The automatic callback already owns the manager cleanup. Shielding lets a
+                # caller cancellation interrupt its wait without cancelling that owner.
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if not task.done():
                     raise
-                except Exception as error:
-                    log_tool_action_warning(
-                        logger,
-                        "Failed to clean up sandbox resources after streamed run",
-                        error,
+            else:
+                if (
+                    not task.cancelled()
+                    and task.exception() is None
+                    and (
+                        task_was_active
+                        or self._sandbox_cleanup is None
+                        or self._sandbox_resume_state_pending
                     )
-
-            task = asyncio.create_task(_cleanup_once())
-            self._sandbox_cleanup_task = task
-
-        await task
+                ):
+                    return
+        await super().aclose()
 
     def ensure_sandbox_cleanup_on_completion(self) -> None:
         if (
@@ -835,9 +865,7 @@ class RunResultStreaming(RunResultBase):
         original_task = self.run_loop_task
         self._sandbox_wrapped_run_loop_task = original_task
         self._sandbox_cleanup_callback_registered = True
-        original_task.add_done_callback(
-            lambda _task: asyncio.create_task(self._run_sandbox_cleanup())
-        )
+        original_task.add_done_callback(lambda _task: self._start_sandbox_cleanup())
 
         async def _await_run_and_cleanup() -> Any:
             try:
