@@ -672,7 +672,7 @@ class BaseSandboxSession(abc.ABC):
                 or self._has_pending_dependency_close_task()
             ):
                 self._schedule_deferred_dependency_close(shutdown=self._deferred_shutdown_requested)
-            else:
+            elif not self._should_preserve_backend_on_cleanup():
                 try:
                     await self._aclose_dependencies()
                 except BaseException as exc:
@@ -868,7 +868,10 @@ class BaseSandboxSession(abc.ABC):
             deferred_error = exc
 
         raise_if_cleanup_owner_force_cancelling()
-        if not self._has_pending_pty_cleanup_tasks():
+        if (
+            not self._has_pending_pty_cleanup_tasks()
+            and not self._should_preserve_backend_on_cleanup()
+        ):
             try:
                 await self._aclose_dependencies()
             except BaseException as error:

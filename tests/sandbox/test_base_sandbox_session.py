@@ -527,6 +527,72 @@ async def test_aclose_defers_shutdown_until_fallback_snapshot_finishes(
 
 
 @pytest.mark.asyncio
+async def test_aclose_keeps_dependencies_open_after_immediate_fallback_snapshot_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CloseableDependency:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    class RetryableSnapshotSession(_Session):
+        def __init__(self) -> None:
+            self.state = SimpleNamespace(manifest=Manifest(), type="test")
+            self.before_stop_calls = 0
+            self.snapshot_calls = 0
+            self.shutdown_calls = 0
+
+        async def _before_stop(self) -> None:
+            self.before_stop_calls += 1
+            if self.before_stop_calls == 1:
+                raise RuntimeError("stop cleanup failed")
+
+        async def stop(self) -> None:
+            await inspect.unwrap(BaseSandboxSession.stop)(self)
+
+        async def _persist_snapshot(self) -> None:
+            self.snapshot_calls += 1
+            if self.snapshot_calls == 1:
+                raise RuntimeError("snapshot failed")
+            await self.dependencies.require("snapshot_client")
+
+        async def _shutdown_backend(self) -> None:
+            self.shutdown_calls += 1
+
+    dependency = CloseableDependency()
+    session = RetryableSnapshotSession()
+    session.set_dependencies(
+        Dependencies().bind_factory(
+            "snapshot_client",
+            lambda _dependencies: dependency,
+            owns_result=True,
+        )
+    )
+    await session.dependencies.require("snapshot_client")
+    monkeypatch.setattr(
+        base_sandbox_session,
+        "validate_manifest_mount_credential_boundaries",
+        lambda *args, **kwargs: None,
+    )
+
+    with pytest.raises(RuntimeError, match="stop cleanup failed"):
+        await inspect.unwrap(BaseSandboxSession.aclose)(session)
+
+    assert session._should_preserve_backend_on_cleanup()
+    assert not dependency.closed
+    assert not session._dependencies_closed
+
+    await inspect.unwrap(BaseSandboxSession.aclose)(session)
+
+    assert session.snapshot_calls == 2
+    assert session.shutdown_calls == 1
+    assert dependency.closed
+    assert session._dependencies_closed
+
+
+@pytest.mark.asyncio
 async def test_aclose_retry_joins_detached_snapshot_before_shutdown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
