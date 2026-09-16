@@ -945,10 +945,18 @@ class DaytonaSandboxSession(BaseSandboxSession):
             if worker_task is not None and worker_task is not asyncio.current_task():
                 if not worker_task.done():
                     worker_task.cancel()
-                done, _ = await asyncio.wait(
-                    (worker_task,),
-                    timeout=self.state.timeouts.cleanup_s,
-                )
+                try:
+                    done, _ = await asyncio.wait(
+                        (worker_task,),
+                        timeout=self.state.timeouts.cleanup_s,
+                    )
+                except asyncio.CancelledError:
+                    # Loop shutdown can interrupt this wait after the entry has already been
+                    # detached. Keep the provider worker session-owned so deferred cleanup can
+                    # still observe and drain its finalizer.
+                    if not worker_task.done():
+                        self._track_pty_cleanup_task(worker_task)
+                    raise
                 if done:
                     await asyncio.gather(worker_task, return_exceptions=True)
                 else:

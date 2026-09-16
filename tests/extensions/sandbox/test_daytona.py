@@ -1714,6 +1714,52 @@ class TestDaytonaSandbox:
         assert worker_task.done()
         assert not session._has_pending_pty_cleanup_tasks()
 
+    @pytest.mark.asyncio
+    async def test_terminate_pty_entry_tracks_worker_when_wait_is_cancelled(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+        sandbox = _FakeDaytonaSandbox()
+        state = daytona_module.DaytonaSandboxSessionState(
+            manifest=Manifest(root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT),
+            snapshot=NoopSnapshot(id="snapshot"),
+            sandbox_id=sandbox.id,
+        )
+        session = daytona_module.DaytonaSandboxSession.from_state(state, sandbox=sandbox)
+        entry = daytona_module._DaytonaPtySessionEntry(  # noqa: SLF001
+            daytona_session_id="session-123",
+            pty_handle=object(),
+            tty=False,
+            cmd_id="cmd-123",
+        )
+        finalizer_started = asyncio.Event()
+        release_finalizer = asyncio.Event()
+
+        async def worker() -> None:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                finalizer_started.set()
+                await release_finalizer.wait()
+
+        worker_task = asyncio.create_task(worker())
+        entry.worker_task = worker_task
+        cleanup_task = asyncio.create_task(session._terminate_pty_entry(entry))  # noqa: SLF001
+        try:
+            await finalizer_started.wait()
+            cleanup_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await cleanup_task
+
+            assert worker_task in (session._pty_cleanup_tasks or set())
+            assert session._has_pending_pty_cleanup_tasks()
+        finally:
+            release_finalizer.set()
+            await asyncio.gather(worker_task, return_exceptions=True)
+            await asyncio.gather(cleanup_task, return_exceptions=True)
+            await asyncio.sleep(0)
+
 
 # ---------------------------------------------------------------------------
 # DaytonaCloudBucketMountStrategy tests

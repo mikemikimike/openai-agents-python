@@ -673,6 +673,7 @@ class SandboxRuntimeSessionManager(Generic[TContext]):
             try:
                 await asyncio.shield(task)
             finally:
+                raise_if_cleanup_owner_force_cancelling()
                 deferred_cleanup_task = resources.deferred_cleanup_task
                 if deferred_cleanup_task is not None:
                     await asyncio.shield(deferred_cleanup_task)

@@ -47,7 +47,7 @@ from agents.sandbox import (
     SandboxRunConfig,
     User,
 )
-from agents.sandbox._cleanup_owner import create_cleanup_owner
+from agents.sandbox._cleanup_owner import create_cleanup_owner, force_cancel_cleanup_owner
 from agents.sandbox._mount_security import (
     REDACTED_MOUNT_AUTHORITY_KEY,
     validate_manifest_mount_credential_boundaries,
@@ -1385,6 +1385,41 @@ async def test_session_manager_logs_detached_follow_up_cleanup_failure(
         and record.getMessage().startswith("Detached sandbox cleanup failed")
         for record in caplog.records
     )
+
+
+@pytest.mark.asyncio
+async def test_forced_follow_up_cancellation_skips_deferred_cleanup_wait() -> None:
+    agent = SandboxAgent(name="worker", model=ScriptedModel(), instructions="Worker.")
+    session = _FakeSession(Manifest())
+    resources = _SandboxSessionResources(
+        session=session,
+        client=None,
+        owns_session=True,
+    )
+    manager = SandboxRuntimeSessionManager(
+        starting_agent=agent,
+        sandbox_config=SandboxRunConfig(session=session),
+        run_state=None,
+    )
+
+    resource_cleanup = asyncio.create_task(asyncio.Event().wait())
+    deferred_cleanup = asyncio.create_task(asyncio.Event().wait())
+    resources._deferred_cleanup_task = deferred_cleanup
+    manager._track_resource_cleanup_task(resource_cleanup, resources)
+    follow_up = next(iter(manager._pending_resource_cleanup_tasks))
+
+    try:
+        await asyncio.sleep(0)
+        force_cancel_cleanup_owner(follow_up)
+        done, _ = await asyncio.wait((follow_up,), timeout=0.5)
+
+        assert follow_up in done
+        assert follow_up.cancelled()
+    finally:
+        force_cancel_cleanup_owner(follow_up)
+        resource_cleanup.cancel()
+        deferred_cleanup.cancel()
+        await asyncio.gather(follow_up, resource_cleanup, deferred_cleanup, return_exceptions=True)
 
 
 @pytest.mark.asyncio
