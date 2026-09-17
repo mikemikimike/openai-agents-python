@@ -2552,7 +2552,18 @@ class AgentRunner:
             else:
                 # The fallback loop is SDK-owned, so its deferred work must use the driver path.
                 caller_owned_loop = False
-        _stop_sync_loop_driver(sync_loop)
+        if not _stop_sync_loop_driver(
+            sync_loop,
+            timeout=_SYNC_BACKGROUND_SETTLEMENT_TIMEOUT_S,
+        ):
+            if caller_owned_loop:
+                raise RuntimeError(
+                    "AgentRunner.run_sync() could not hand off the caller-owned event loop "
+                    "within the cleanup timeout."
+                )
+            # A prior SDK-owned run may still be finalizing an async generator. Keep that owner
+            # alive on its original loop and use a fresh SDK loop for this foreground run.
+            sync_loop = _get_sync_loop(force_new=True)
 
         sync_run_token = _IS_SYNC_RUN.set(True)
         try:

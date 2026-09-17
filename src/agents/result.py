@@ -359,6 +359,12 @@ class RunResultBase(abc.ABC):
     """Serialized sandbox session state captured during the run."""
     _sandbox_resume_state_pending: bool = field(default=False, init=False, repr=False)
     """Whether a late sandbox cleanup operation can still replace the resume state."""
+    _sandbox_resume_state_persisted: bool = field(default=False, init=False, repr=False)
+    """Whether a caller has serialized a checkpoint that references the sandbox backend."""
+    _sandbox_resume_state_persisted_callback: Callable[[], None] | None = field(
+        default=None, init=False, repr=False
+    )
+    """Callback used to transfer backend retention to a persisted sandbox checkpoint."""
     _sandbox_state_checkpoints: list[weakref.ReferenceType[RunState[Any]]] = field(
         default_factory=list, init=False, repr=False
     )
@@ -401,6 +407,15 @@ class RunResultBase(abc.ABC):
         *,
         pending: bool = False,
     ) -> None:
+        if resume_state is None and self._sandbox_resume_state_persisted:
+            # A serialized checkpoint is immutable and may still reference this backend. Do not
+            # erase the live checkpoint when the retry owner later detaches from the result.
+            self._sandbox_resume_state_pending = pending
+            for checkpoint_ref in self._sandbox_state_checkpoints:
+                checkpoint = checkpoint_ref()
+                if checkpoint is not None:
+                    checkpoint._set_sandbox_resume_state_pending(pending)
+            return
         self._sandbox_resume_state = resume_state
         self._sandbox_resume_state_pending = pending
         live_checkpoints: list[weakref.ReferenceType[RunState[Any]]] = []
@@ -419,12 +434,21 @@ class RunResultBase(abc.ABC):
             if checkpoint is not None:
                 checkpoint._set_sandbox_resume_state_pending(pending)
 
+    def _mark_sandbox_resume_state_persisted(self) -> None:
+        self._sandbox_resume_state_persisted = True
+        callback = self._sandbox_resume_state_persisted_callback
+        if callback is not None:
+            callback()
+
     async def aclose(self) -> None:
         """Retry runner-owned sandbox cleanup when the initial cleanup was incomplete."""
 
         cleanup = self._sandbox_cleanup
         if cleanup is None:
             return
+        # Mark the live checkpoint before the first suspension so a concurrent resume cannot
+        # observe an apparently usable state while this cleanup retry is mutating its backend.
+        self._set_sandbox_resume_state_pending(True)
         await cleanup()
 
     def release_agents(self, *, release_new_items: bool = True) -> None:
@@ -819,6 +843,7 @@ class RunResultStreaming(RunResultBase):
             return task
         if self._sandbox_cleanup is None:
             return None
+        self._set_sandbox_resume_state_pending(True)
         task = asyncio.create_task(self._perform_sandbox_cleanup())
         self._sandbox_cleanup_task = task
         return task
@@ -832,6 +857,9 @@ class RunResultStreaming(RunResultBase):
         """Join automatic streamed cleanup before starting a cleanup retry."""
 
         task = self._sandbox_cleanup_task
+        if task is None and self._sandbox_cleanup is None:
+            return
+        self._set_sandbox_resume_state_pending(True)
         if task is not None:
             task_was_active = not task.done()
             try:
@@ -839,8 +867,9 @@ class RunResultStreaming(RunResultBase):
                 # caller cancellation interrupt its wait without cancelling that owner.
                 await asyncio.shield(task)
             except asyncio.CancelledError:
-                if not task.done():
-                    raise
+                # Never start a second cleanup closure after a caller cancellation races with
+                # the existing owner finishing. The owner remains available for a later retry.
+                raise
             else:
                 if (
                     not task.cancelled()

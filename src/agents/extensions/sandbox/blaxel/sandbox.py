@@ -840,24 +840,33 @@ class BlaxelSandboxSession(BaseSandboxSession):
                 registered = True
         except asyncio.TimeoutError as e:
             if not registered:
-                await _settle_pty_cleanup(self._terminate_pty_entry(entry))
+                await _settle_pty_cleanup(
+                    self._terminate_pty_entry(entry),
+                    on_failure=lambda: self._remember_pty_cleanup_retry_entry(entry),
+                )
             raise ExecTimeoutError(command=command, timeout_s=exec_timeout, cause=e) from e
         except asyncio.CancelledError as cancellation:
             if not registered:
                 await _settle_pty_cleanup(
                     self._terminate_pty_entry(entry),
                     initial_cancellation=cancellation,
+                    on_failure=lambda: self._remember_pty_cleanup_retry_entry(entry),
                 )
             raise
         except Exception as e:
             if not registered:
-                await _settle_pty_cleanup(self._terminate_pty_entry(entry))
+                await _settle_pty_cleanup(
+                    self._terminate_pty_entry(entry),
+                    on_failure=lambda: self._remember_pty_cleanup_retry_entry(entry),
+                )
             raise _blaxel_exec_transport_error(command=command, cause=e) from e
 
         if pruned is not None:
             try:
                 await self._settle_pty_cleanup(
-                    self._terminate_pty_entry(pruned), propagate_timeout=True
+                    self._terminate_pty_entry(pruned),
+                    propagate_timeout=True,
+                    on_failure=lambda: self._remember_pty_cleanup_retry_entry(pruned),
                 )
             except BaseException:
                 await self._rollback_pty_start(
@@ -932,7 +941,9 @@ class BlaxelSandboxSession(BaseSandboxSession):
             self._pty_sessions.clear()
             self._reserved_pty_process_ids.clear()
 
-        await self._cleanup_pty_entries(entries, self._terminate_pty_entry)
+        await self._cleanup_pty_entries(
+            self._merge_pty_cleanup_retry_entries(entries), self._terminate_pty_entry
+        )
 
     # -- PTY internals -------------------------------------------------------
 
@@ -1013,7 +1024,9 @@ class BlaxelSandboxSession(BaseSandboxSession):
                 self._reserved_pty_process_ids.discard(process_id)
             if removed is not None:
                 await self._settle_pty_cleanup(
-                    self._terminate_pty_entry(removed), propagate_timeout=False
+                    self._terminate_pty_entry(removed),
+                    propagate_timeout=False,
+                    on_failure=lambda: self._remember_pty_cleanup_retry_entry(removed),
                 )
             live_process_id = None
 

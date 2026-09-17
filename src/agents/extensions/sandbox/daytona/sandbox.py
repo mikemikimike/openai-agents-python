@@ -748,7 +748,9 @@ class DaytonaSandboxSession(BaseSandboxSession):
         if pruned is not None:
             try:
                 await self._settle_pty_cleanup(
-                    self._terminate_pty_entry(pruned), propagate_timeout=True
+                    self._terminate_pty_entry(pruned),
+                    propagate_timeout=True,
+                    on_failure=lambda: self._remember_pty_cleanup_retry_entry(pruned),
                 )
             except BaseException:
                 await self._rollback_pty_start(
@@ -883,7 +885,9 @@ class DaytonaSandboxSession(BaseSandboxSession):
                 self._reserved_pty_process_ids.discard(process_id)
             if removed is not None:
                 await self._settle_pty_cleanup(
-                    self._terminate_pty_entry(removed), propagate_timeout=False
+                    self._terminate_pty_entry(removed),
+                    propagate_timeout=False,
+                    on_failure=lambda: self._remember_pty_cleanup_retry_entry(removed),
                 )
             live_process_id = None
 
@@ -900,7 +904,9 @@ class DaytonaSandboxSession(BaseSandboxSession):
             self._pty_sessions.clear()
             self._reserved_pty_process_ids.clear()
 
-        await self._cleanup_pty_entries(entries, self._terminate_pty_entry)
+        await self._cleanup_pty_entries(
+            self._merge_pty_cleanup_retry_entries(entries), self._terminate_pty_entry
+        )
 
     async def _collect_pty_output(
         self,

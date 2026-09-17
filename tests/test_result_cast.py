@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import gc
 import weakref
@@ -261,6 +262,54 @@ def test_run_result_streaming_release_agents_uses_weakref_until_agent_is_collect
     assert agent_ref() is None
     with pytest.raises(AgentsException):
         _ = streaming_result.last_agent
+
+
+@pytest.mark.asyncio
+async def test_streaming_aclose_does_not_start_second_cleanup_after_cancellation() -> None:
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_calls = 0
+    streaming_result = RunResultStreaming(
+        input="stream",
+        new_items=[],
+        raw_responses=[],
+        final_output=None,
+        input_guardrail_results=[],
+        output_guardrail_results=[],
+        tool_input_guardrail_results=[],
+        tool_output_guardrail_results=[],
+        context_wrapper=RunContextWrapper(context=None),
+        current_agent=Agent(name="streaming-agent"),
+        current_turn=0,
+        max_turns=1,
+        _current_agent_output_schema=None,
+        trace=None,
+        interruptions=[],
+    )
+
+    async def cleanup() -> None:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        cleanup_started.set()
+        await release_cleanup.wait()
+
+    streaming_result._sandbox_cleanup = cleanup
+    owner_task = asyncio.create_task(streaming_result._run_sandbox_cleanup())
+    try:
+        await cleanup_started.wait()
+        close_task = asyncio.create_task(streaming_result.aclose())
+        await asyncio.sleep(0)
+        close_task.cancel("caller stopped waiting")
+        with pytest.raises(asyncio.CancelledError):
+            await close_task
+        assert cleanup_calls == 1
+
+        release_cleanup.set()
+        await owner_task
+        assert cleanup_calls == 1
+    finally:
+        release_cleanup.set()
+        await asyncio.gather(owner_task, return_exceptions=True)
 
 
 def test_run_result_agent_tool_invocation_returns_none_for_plain_context() -> None:

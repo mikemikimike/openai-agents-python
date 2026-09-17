@@ -231,6 +231,8 @@ class BaseSandboxSession(abc.ABC):
     _max_local_dir_file_concurrency: int | None = DEFAULT_MAX_LOCAL_DIR_FILE_CONCURRENCY
     _archive_limits: SandboxArchiveLimits | None = None
     _pty_cleanup_tasks: set[asyncio.Future[Any]] | None = None
+    _pty_cleanup_retry_entries: list[Any] | None = None
+    _pty_cleanup_failure: bool = False
     _snapshot_persistence_task: asyncio.Task[None] | None = None
     _dependencies_close_task: asyncio.Task[None] | None = None
     _deferred_dependency_close_task: asyncio.Task[Any] | None = None
@@ -429,7 +431,7 @@ class BaseSandboxSession(abc.ABC):
                 # Persist before re-raising cancellation or a cleanup deadline/error so the
                 # backend cannot be deleted with workspace state that exists only remotely.
                 self._backend_preservation_required = True
-                if self._has_pending_pty_cleanup_tasks():
+                if self._pty_cleanup_failure or self._has_pending_pty_cleanup_tasks():
                     # The detached PTY owner may still mutate the workspace. Do not start a
                     # snapshot until that owner has finished; the preserved backend remains the
                     # source of truth for a later resume.
@@ -543,7 +545,12 @@ class BaseSandboxSession(abc.ABC):
     async def _before_stop(self) -> None:
         """Run transient process cleanup before snapshot persistence."""
 
-        await self.pty_terminate_all()
+        self._pty_cleanup_failure = False
+        try:
+            await self.pty_terminate_all()
+        except BaseException:
+            self._pty_cleanup_failure = True
+            raise
 
     async def _persist_snapshot(self) -> None:
         """Persist/snapshot the workspace."""
@@ -797,10 +804,17 @@ class BaseSandboxSession(abc.ABC):
 
     def _has_pending_pty_cleanup_tasks(self, *, exclude_snapshot: bool = False) -> bool:
         snapshot_task = self._snapshot_persistence_task if exclude_snapshot else None
-        return any(
+        return bool(self._pty_cleanup_retry_entries) or any(
             task is not snapshot_task and not task.done()
             for task in (self._pty_cleanup_tasks or ())
         )
+
+    def _has_pending_pty_cleanup_retry_entries(self) -> bool:
+        return bool(self._pty_cleanup_retry_entries)
+
+    async def _retry_pending_pty_cleanup(self) -> None:
+        if self._has_pending_pty_cleanup_retry_entries():
+            await self.pty_terminate_all()
 
     def _has_pending_dependency_close_task(self) -> bool:
         task = self._dependencies_close_task
@@ -867,6 +881,9 @@ class BaseSandboxSession(abc.ABC):
                 # Let done callbacks update preservation state before deciding whether the backend
                 # can be torn down. In particular, fallback snapshot completion clears this state.
                 await asyncio.sleep(0)
+                if self._has_pending_pty_cleanup_retry_entries():
+                    await self._retry_pending_pty_cleanup()
+                    continue
                 if (
                     self._deferred_shutdown_requested
                     and not self._should_preserve_backend_on_cleanup()
@@ -1060,7 +1077,36 @@ class BaseSandboxSession(abc.ABC):
             return float(timeout)
         return _DEFAULT_PTY_CLEANUP_TIMEOUT_S
 
-    def _track_pty_cleanup_task(self, task: asyncio.Future[Any]) -> None:
+    def _remember_pty_cleanup_retry_entry(self, entry: Any) -> None:
+        entries = self._pty_cleanup_retry_entries
+        if entries is None:
+            entries = []
+            self._pty_cleanup_retry_entries = entries
+        if not any(existing is entry for existing in entries):
+            entries.append(entry)
+
+    def _take_pty_cleanup_retry_entries(self) -> list[Any]:
+        entries = self._pty_cleanup_retry_entries
+        self._pty_cleanup_retry_entries = None
+        return list(entries) if entries is not None else []
+
+    def _merge_pty_cleanup_retry_entries(self, entries: Sequence[Any]) -> list[Any]:
+        retry_entries = self._take_pty_cleanup_retry_entries()
+        if not retry_entries:
+            return list(entries)
+
+        merged: list[Any] = list(retry_entries)
+        for entry in entries:
+            if not any(existing is entry for existing in merged):
+                merged.append(entry)
+        return merged
+
+    def _track_pty_cleanup_task(
+        self,
+        task: asyncio.Future[Any],
+        *,
+        on_failure: Callable[[], None] | None = None,
+    ) -> None:
         tasks = self._pty_cleanup_tasks
         if tasks is None:
             tasks = set()
@@ -1069,8 +1115,10 @@ class BaseSandboxSession(abc.ABC):
 
         def forget_task(done: asyncio.Future[Any]) -> None:
             tasks.discard(done)
-            if not done.cancelled():
-                error = done.exception()
+            error = None if done.cancelled() else done.exception()
+            if error is not None or done.cancelled():
+                if on_failure is not None:
+                    on_failure()
                 if error is not None:
                     log_tool_action_error(
                         logger,
@@ -1086,6 +1134,7 @@ class BaseSandboxSession(abc.ABC):
         *,
         timeout: float | None = None,
         propagate_timeout: bool = True,
+        on_failure: Callable[[], None] | None = None,
     ) -> None:
         """Settle cleanup after PTY ownership leaves the session registry.
 
@@ -1105,7 +1154,7 @@ class BaseSandboxSession(abc.ABC):
                 0.1,
             ),
         )
-        self._track_pty_cleanup_task(task)
+        self._track_pty_cleanup_task(task, on_failure=on_failure)
         _track_sync_background_task(task)
         caller_cancellation: asyncio.CancelledError | None = None
         deadline = asyncio.get_running_loop().time() + (
@@ -1163,6 +1212,7 @@ class BaseSandboxSession(abc.ABC):
             await self._settle_pty_cleanup(
                 rollback(),
                 propagate_timeout=False,
+                on_failure=lambda: self._remember_pty_cleanup_retry_entry(entry),
             )
         except BaseException as error:
             raise_if_cleanup_owner_force_cancelling(error)
@@ -1187,6 +1237,7 @@ class BaseSandboxSession(abc.ABC):
                     cleanup_entry(entry),
                     timeout=batch_timeout,
                     propagate_timeout=False,
+                    on_failure=lambda entry=entry: self._remember_pty_cleanup_retry_entry(entry),
                 ),
                 name="agents.pty_cleanup_batch",
             )
@@ -1229,6 +1280,7 @@ class BaseSandboxSession(abc.ABC):
                 try:
                     task.result()
                 except BaseException as error:
+                    self._remember_pty_cleanup_retry_entry(entries[index])
                     raise_if_cleanup_owner_force_cancelling(error, nested_tasks=(task,))
                     cleanup_errors.setdefault(index, error)
         if caller_cancellation is not None:

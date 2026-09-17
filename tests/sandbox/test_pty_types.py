@@ -79,3 +79,20 @@ async def test_settle_pty_cleanup_preserves_initial_cancel_reason_when_cleanup_f
         )
 
     assert exc_info.value.args == ("startup-cancel",)
+
+
+@pytest.mark.asyncio
+async def test_settle_pty_cleanup_notifies_failure_owner() -> None:
+    failed = False
+
+    async def cleanup() -> None:
+        raise RuntimeError("synthetic cleanup failure")
+
+    def remember_failure() -> None:
+        nonlocal failed
+        failed = True
+
+    with pytest.raises(RuntimeError, match="synthetic cleanup failure"):
+        await _settle_pty_cleanup(cleanup(), on_failure=remember_failure)
+
+    assert failed

@@ -391,6 +391,47 @@ async def test_pty_cleanup_attempts_remaining_entries_after_failure() -> None:
 
 
 @pytest.mark.asyncio
+async def test_failed_pty_cleanup_is_retried_by_provider_cleanup() -> None:
+    entry = object()
+    attempts: list[object] = []
+
+    class RetryingSession(_Session):
+        def __init__(self) -> None:
+            self._pty_lock = asyncio.Lock()
+            self._pty_processes = {7: entry}
+            self._reserved_pty_process_ids = {7}
+
+        async def _terminate_pty_entry(self, value: object) -> None:
+            attempts.append(value)
+            if len(attempts) == 1:
+                raise RuntimeError("first PTY cleanup failed")
+
+        async def pty_terminate_all(self) -> None:
+            async with self._pty_lock:
+                entries = list(self._pty_processes.values())
+                self._pty_processes.clear()
+                self._reserved_pty_process_ids.clear()
+
+            await self._cleanup_pty_entries(
+                self._merge_pty_cleanup_retry_entries(entries), self._terminate_pty_entry
+            )
+
+    session = RetryingSession()
+
+    with pytest.raises(RuntimeError, match="first PTY cleanup failed"):
+        await session.pty_terminate_all()
+
+    assert session._has_pending_pty_cleanup_tasks()
+    assert session._pty_cleanup_retry_entries == [entry]
+
+    await session.pty_terminate_all()
+
+    assert attempts == [entry, entry]
+    assert not session._has_pending_pty_cleanup_tasks()
+    assert session._pty_cleanup_retry_entries is None
+
+
+@pytest.mark.asyncio
 async def test_pty_cleanup_raises_first_entry_error_deterministically() -> None:
     second_failed = asyncio.Event()
     release_first = asyncio.Event()
@@ -691,6 +732,118 @@ async def test_aclose_keeps_dependencies_open_after_immediate_fallback_snapshot_
     assert session.shutdown_calls == 1
     assert dependency.closed
     assert session._dependencies_closed
+
+
+@pytest.mark.asyncio
+async def test_aclose_retries_failed_pty_cleanup_before_closing_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CloseableDependency:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    entry = object()
+
+    class RetryablePtySession(_Session):
+        def __init__(self) -> None:
+            self.state = SimpleNamespace(manifest=Manifest(), type="test")
+            self._pty_lock = asyncio.Lock()
+            self._pty_processes = {7: entry}
+            self._reserved_pty_process_ids = {7}
+            self.pty_cleanup_attempts = 0
+            self.snapshot_calls = 0
+            self.shutdown_calls = 0
+
+        async def _terminate_pty_entry(self, value: object) -> None:
+            assert value is entry
+            self.pty_cleanup_attempts += 1
+            if self.pty_cleanup_attempts == 1:
+                raise RuntimeError("PTY cleanup failed")
+
+        async def pty_terminate_all(self) -> None:
+            async with self._pty_lock:
+                entries = list(self._pty_processes.values())
+                self._pty_processes.clear()
+                self._reserved_pty_process_ids.clear()
+            await self._cleanup_pty_entries(
+                self._merge_pty_cleanup_retry_entries(entries), self._terminate_pty_entry
+            )
+
+        async def stop(self) -> None:
+            await inspect.unwrap(BaseSandboxSession.stop)(self)
+
+        async def _persist_snapshot(self) -> None:
+            self.snapshot_calls += 1
+
+        async def _shutdown_backend(self) -> None:
+            self.shutdown_calls += 1
+
+    dependency = CloseableDependency()
+    session = RetryablePtySession()
+    session.set_dependencies(
+        Dependencies().bind_factory(
+            "tests.pty_retry_dependency",
+            lambda _dependencies: dependency,
+            owns_result=True,
+        )
+    )
+    await session.dependencies.require("tests.pty_retry_dependency")
+    monkeypatch.setattr(
+        base_sandbox_session,
+        "validate_manifest_mount_credential_boundaries",
+        lambda *args, **kwargs: None,
+    )
+
+    with pytest.raises(RuntimeError, match="PTY cleanup failed"):
+        await inspect.unwrap(BaseSandboxSession.aclose)(session)
+
+    deferred_task = session._deferred_dependency_close_task
+    assert deferred_task is not None
+    await asyncio.wait_for(deferred_task, timeout=0.5)
+    assert session.pty_cleanup_attempts == 2
+    assert session.snapshot_calls == 0
+    assert session.shutdown_calls == 0
+    assert not dependency.closed
+    assert not session._dependencies_closed
+
+    await inspect.unwrap(BaseSandboxSession.aclose)(session)
+
+    assert session.snapshot_calls == 1
+    assert session.shutdown_calls == 1
+    assert dependency.closed
+    assert session._dependencies_closed
+
+
+@pytest.mark.asyncio
+async def test_stop_does_not_snapshot_after_pty_termination_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailedPtySession(_Session):
+        def __init__(self) -> None:
+            self.state = SimpleNamespace(manifest=Manifest(), type="test")
+            self.snapshot_calls = 0
+
+        async def pty_terminate_all(self) -> None:
+            raise RuntimeError("PTY termination failed")
+
+        async def _persist_snapshot(self) -> None:
+            self.snapshot_calls += 1
+
+    session = FailedPtySession()
+    monkeypatch.setattr(
+        base_sandbox_session,
+        "validate_manifest_mount_credential_boundaries",
+        lambda *args, **kwargs: None,
+    )
+
+    with pytest.raises(RuntimeError, match="PTY termination failed"):
+        await inspect.unwrap(BaseSandboxSession.stop)(session)
+
+    assert session.snapshot_calls == 0
+    assert session._should_preserve_backend_on_cleanup()
 
 
 @pytest.mark.asyncio

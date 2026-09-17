@@ -277,6 +277,12 @@ class SandboxSession(BaseSandboxSession):
     def _has_pending_pty_cleanup_tasks(self, *, exclude_snapshot: bool = False) -> bool:
         return self._inner._has_pending_pty_cleanup_tasks(exclude_snapshot=exclude_snapshot)
 
+    def _has_pending_pty_cleanup_retry_entries(self) -> bool:
+        return self._inner._has_pending_pty_cleanup_retry_entries()
+
+    async def _retry_pending_pty_cleanup(self) -> None:
+        await self._inner._retry_pending_pty_cleanup()
+
     async def _wait_for_tracked_cleanup_tasks(
         self, *, timeout: float | None = None
     ) -> tuple[asyncio.CancelledError | None, bool]:

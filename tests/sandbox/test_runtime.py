@@ -4748,6 +4748,28 @@ async def test_runner_keeps_retry_owner_after_a_failed_cleanup_retry() -> None:
 
 
 @pytest.mark.asyncio
+async def test_persisted_checkpoint_keeps_backend_after_cleanup_retry() -> None:
+    session = _RetryablePreservingStopSession(Manifest())
+    client = _FakeClient(session)
+    agent = SandboxAgent(
+        name="sandbox",
+        model=ScriptedModel(steps=[[get_final_output_message("done")]]),
+        instructions="Base instructions.",
+    )
+
+    result = await Runner.run(agent, "hello", run_config=_sandbox_run_config(client))
+    checkpoint = result.to_state()
+    serialized = checkpoint.to_json()
+
+    assert serialized["sandbox"]["backend_id"] == "fake"
+    await result.aclose()
+
+    assert client.delete_calls == 0
+    assert result._sandbox_cleanup is None
+    assert checkpoint.to_json()["sandbox"]["backend_id"] == "fake"
+
+
+@pytest.mark.asyncio
 async def test_runner_does_not_expose_checkpoint_before_detached_snapshot_finishes() -> None:
     release_pty = asyncio.Event()
 

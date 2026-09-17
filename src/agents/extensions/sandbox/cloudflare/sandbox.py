@@ -1060,7 +1060,9 @@ class CloudflareSandboxSession(BaseSandboxSession):
                 self._reserved_pty_process_ids.discard(process_id)
             if removed is not None:
                 await self._settle_pty_cleanup(
-                    self._terminate_pty_entry(removed), propagate_timeout=False
+                    self._terminate_pty_entry(removed),
+                    propagate_timeout=False,
+                    on_failure=lambda: self._remember_pty_cleanup_retry_entry(removed),
                 )
             live_process_id = None
 
@@ -1197,7 +1199,9 @@ class CloudflareSandboxSession(BaseSandboxSession):
         if pruned_entry is not None:
             try:
                 await self._settle_pty_cleanup(
-                    self._terminate_pty_entry(pruned_entry), propagate_timeout=True
+                    self._terminate_pty_entry(pruned_entry),
+                    propagate_timeout=True,
+                    on_failure=lambda: self._remember_pty_cleanup_retry_entry(pruned_entry),
                 )
             except BaseException:
                 await self._rollback_pty_start(
@@ -1272,7 +1276,9 @@ class CloudflareSandboxSession(BaseSandboxSession):
             self._pty_processes.clear()
             self._reserved_pty_process_ids.clear()
 
-        await self._cleanup_pty_entries(entries, self._terminate_pty_entry)
+        await self._cleanup_pty_entries(
+            self._merge_pty_cleanup_retry_entries(entries), self._terminate_pty_entry
+        )
 
     async def read(self, path: Path | str, *, user: str | User | None = None) -> io.IOBase:
         if user is not None:

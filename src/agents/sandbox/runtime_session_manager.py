@@ -75,6 +75,7 @@ class _SandboxSessionResources:
         self._dependencies_must_remain_open = False
         self._dependency_close_failed = False
         self._cleanup_abandoned = False
+        self._retain_backend_for_persisted_state = False
 
     @property
     def session(self) -> BaseSandboxSession:
@@ -183,6 +184,12 @@ class _SandboxSessionResources:
                 # Snapshot completion callbacks may update preservation after the tracked future
                 # wakes its waiters. Give those callbacks a turn before making the shutdown call.
                 await asyncio.sleep(0)
+                if self._session._has_pending_pty_cleanup_retry_entries():
+                    await self._session._retry_pending_pty_cleanup()
+                    continue
+                if self._retain_backend_for_persisted_state:
+                    self._session._require_backend_preservation()
+                    self._mark_late_resume_state_pending()
                 if not self._session._should_preserve_backend_on_cleanup():
                     self._dependencies_must_remain_open = False
                 if (
@@ -300,6 +307,10 @@ class _SandboxSessionResources:
                 and self._session._should_preserve_backend_on_cleanup()
                 and not self._backend_delete_failed
             )
+            if self._retain_backend_for_persisted_state:
+                self._session._require_backend_preservation()
+                self._mark_late_resume_state_pending()
+                preserve_backend = True
             if preserve_backend:
                 self._mark_late_resume_state_pending()
             if not preserve_backend:
@@ -418,6 +429,15 @@ class SandboxRuntimeSessionManager(Generic[TContext]):
         self._resume_state_observers: list[Callable[[dict[str, object]], None]] = []
         self._cleanup_finalization_observers: list[Callable[[], None]] = []
         self._agent_guards_detached = False
+        self._persistent_resume_state_published = False
+
+    def mark_resume_state_persisted(self) -> None:
+        """Keep a backend alive when a serialized checkpoint now references it."""
+
+        self._persistent_resume_state_published = True
+        for resources in self._resources_by_agent.values():
+            resources._retain_backend_for_persisted_state = True
+            resources.session._require_backend_preservation()
 
     @staticmethod
     def _resume_agent_base_key(agent: Agent[Any]) -> str:
@@ -806,9 +826,13 @@ class SandboxRuntimeSessionManager(Generic[TContext]):
                 )
                 return
 
-            if self._preserved_backend_retry_required and any(
-                resources._has_retryable_open_dependencies()
-                for resources in self._resources_by_agent.values()
+            if (
+                (not self._persistent_resume_state_published)
+                and self._preserved_backend_retry_required
+                and any(
+                    resources._has_retryable_open_dependencies()
+                    for resources in self._resources_by_agent.values()
+                )
             ):
                 return
 
@@ -824,7 +848,10 @@ class SandboxRuntimeSessionManager(Generic[TContext]):
             # A failed cleanup may have no open dependencies, but the preserved backend still
             # needs an owner that can retry stop/snapshot/delete. Keep the resource graph alive
             # until a later cleanup attempt proves that the backend is gone.
-            if self._preserved_backend_retry_required:
+            if (
+                self._preserved_backend_retry_required
+                and not self._persistent_resume_state_published
+            ):
                 return
 
         self._resources_by_agent.clear()

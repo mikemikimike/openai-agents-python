@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import random
-from collections.abc import Awaitable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 
 from .._cleanup_owner import create_cleanup_owner
@@ -24,6 +24,7 @@ async def _settle_pty_cleanup(
     cleanup: Awaitable[None],
     *,
     initial_cancellation: asyncio.CancelledError | None = None,
+    on_failure: Callable[[], None] | None = None,
 ) -> None:
     cleanup_task = create_cleanup_owner(cleanup, name="agents.pty_cleanup")
     cancellation = initial_cancellation
@@ -37,6 +38,8 @@ async def _settle_pty_cleanup(
     try:
         cleanup_task.result()
     except BaseException:
+        if on_failure is not None:
+            on_failure()
         if cancellation is not None:
             raise cancellation from None
         raise

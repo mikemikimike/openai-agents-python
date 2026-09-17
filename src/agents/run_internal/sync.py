@@ -100,9 +100,9 @@ class _SyncLoopDriver:
         self._shutdown_asyncgens_started = True
         await self.loop.shutdown_asyncgens()
 
-    def stop(self) -> None:
+    def stop(self, *, timeout: float = _SYNC_BACKGROUND_SETTLEMENT_TIMEOUT_S) -> bool:
         if not self.thread.is_alive():
-            return
+            return True
 
         self._handoff_requested = True
 
@@ -122,9 +122,10 @@ class _SyncLoopDriver:
         try:
             self.loop.call_soon_threadsafe(stop_loop)
         except RuntimeError:
-            pass
+            return not self.thread.is_alive()
         if threading.current_thread() is not self.thread:
-            self.thread.join()
+            self.thread.join(timeout=max(timeout, 0.0))
+        return not self.thread.is_alive()
 
 
 async def _settle_pending_sync_background_tasks(loop: asyncio.AbstractEventLoop) -> None:
@@ -191,9 +192,9 @@ def _get_default_loop() -> asyncio.AbstractEventLoop | None:
     return loop
 
 
-def _get_sync_loop() -> asyncio.AbstractEventLoop:
+def _get_sync_loop(*, force_new: bool = False) -> asyncio.AbstractEventLoop:
     loop = getattr(_SYNC_LOOP_LOCAL, "loop", None)
-    if loop is None or loop.is_closed():
+    if force_new or loop is None or loop.is_closed():
         loop = asyncio.new_event_loop()
         _SYNC_LOOP_LOCAL.loop = loop
     return loop
@@ -235,11 +236,16 @@ def _track_sync_background_task(task: asyncio.Task[Any]) -> None:
     task.add_done_callback(forget)
 
 
-def _stop_sync_loop_driver(loop: asyncio.AbstractEventLoop) -> None:
+def _stop_sync_loop_driver(
+    loop: asyncio.AbstractEventLoop,
+    *,
+    timeout: float = _SYNC_BACKGROUND_SETTLEMENT_TIMEOUT_S,
+) -> bool:
     with _SYNC_DRIVER_LOCK:
         driver = _SYNC_LOOP_DRIVERS.get(loop)
     if driver is not None:
-        driver.stop()
+        return driver.stop(timeout=timeout)
+    return True
 
 
 def _start_sync_loop_driver(loop: asyncio.AbstractEventLoop) -> _SyncLoopDriver:

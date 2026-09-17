@@ -127,6 +127,9 @@ class SandboxRuntime(Generic[TContext]):
     def register_cleanup_finalization_observer(self, observer: Callable[[], None]) -> None:
         self._session_manager.register_cleanup_finalization_observer(observer)
 
+    def mark_resume_state_persisted(self) -> None:
+        self._session_manager.mark_resume_state_persisted()
+
     def finalize_result_ownership(self, result: RunResult | RunResultStreaming) -> None:
         if self.runner_ownership_requires_transfer:
             self._session_manager.detach_runner_agent_guards()
@@ -158,6 +161,7 @@ class SandboxRuntime(Generic[TContext]):
     def apply_result_metadata(self, result: RunResult | RunResultStreaming) -> None:
         session = self.current_session
         result._sandbox_session = session
+        result._sandbox_resume_state_persisted_callback = self.mark_resume_state_persisted
         self._session_manager.register_resume_state_observer(
             lambda resume_state: result._update_sandbox_resume_state(
                 resume_state,

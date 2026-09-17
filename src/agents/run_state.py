@@ -1843,6 +1843,10 @@ class RunState(Generic[TContext, TAgent]):
             )
             if not self._sandbox_resume_state_pending:
                 self._sandbox = copy.deepcopy(getattr(owner, "_sandbox_resume_state", None))
+                if self._sandbox is not None:
+                    mark_persisted = getattr(owner, "_mark_sandbox_resume_state_persisted", None)
+                    if callable(mark_persisted):
+                        mark_persisted()
         if self._sandbox_resume_state_pending:
             raise UserError(
                 "Cannot serialize RunState while sandbox cleanup is still settling; retry after "
